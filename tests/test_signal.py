@@ -1,20 +1,21 @@
-"""Basic sanity checks for bot/signal.py."""
+"""Tests for bot/signal.py — dual-TF SMC pipeline."""
 import numpy as np
 import pandas as pd
 import pytest
 
-from bot.signal import add_indicators, get_signal_latest
+from bot.signal import get_htf_context, get_ltf_signal, get_signal_latest
 
 
-def _make_df(n: int = 300) -> pd.DataFrame:
-    """Synthetic ascending price series with some volatility."""
-    rng = np.random.default_rng(42)
-    close = 50_000 + np.cumsum(rng.normal(0, 100, n))
-    open_ = close - rng.uniform(-50, 50, n)
-    high  = np.maximum(close, open_) + rng.uniform(10, 100, n)
-    low   = np.minimum(close, open_) - rng.uniform(10, 100, n)
+def _make_df(n: int, freq: str = "1h", seed: int = 42, bullish: bool = True) -> pd.DataFrame:
+    """Synthetic OHLCV. bullish=True produces an upward-drifting series."""
+    rng   = np.random.default_rng(seed)
+    drift = 50 if bullish else -50
+    close = 50_000 + np.cumsum(rng.normal(drift, 200, n))
+    open_ = close - rng.uniform(-100, 100, n)
+    high  = np.maximum(close, open_) + rng.uniform(20, 200, n)
+    low   = np.minimum(close, open_) - rng.uniform(20, 200, n)
     return pd.DataFrame({
-        "ts":     pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC"),
+        "ts":     pd.date_range("2023-01-01", periods=n, freq=freq, tz="UTC"),
         "open":   open_,
         "high":   high,
         "low":    low,
@@ -23,35 +24,79 @@ def _make_df(n: int = 300) -> pd.DataFrame:
     })
 
 
-def test_add_indicators_columns():
-    df = add_indicators(_make_df())
-    assert "ema200" in df.columns
-    assert "atr"    in df.columns
-    assert "swing_high" in df.columns
-    assert "swing_low"  in df.columns
+def _make_1h(n: int = 300, bullish: bool = True) -> pd.DataFrame:
+    return _make_df(n, freq="1h", bullish=bullish)
 
 
-def test_add_indicators_no_lookahead():
-    """Shifting by 1 means no bar sees its own high/low as swing reference."""
-    df = add_indicators(_make_df(300))
-    # swing_high is rolling(20).max().shift(1) — the first 20 values should be NaN
-    assert df["swing_high"].iloc[:20].isna().all()
+def _make_5m(n: int = 600) -> pd.DataFrame:
+    return _make_df(n, freq="5min", seed=99)
 
 
-def test_get_signal_latest_returns_flat_on_short_df():
-    df = _make_df(50)   # less than STARTUP_CANDLE
-    sig = get_signal_latest(df)
+# ── HTF context ───────────────────────────────────────────────────────────────
+
+def test_htf_context_keys():
+    ctx = get_htf_context(_make_1h())
+    assert "bias"            in ctx
+    assert "poi_zones"       in ctx
+    assert "fib50"           in ctx
+    assert "liquidity_highs" in ctx
+    assert "liquidity_lows"  in ctx
+
+
+def test_htf_context_bias_values():
+    ctx = get_htf_context(_make_1h(300, bullish=True))
+    assert ctx["bias"] in ("bullish", "bearish", "neutral")
+
+
+def test_htf_context_neutral_on_short_df():
+    ctx = get_htf_context(_make_1h(10))
+    assert ctx["bias"] == "neutral"
+    assert ctx["poi_zones"] == []
+
+
+def test_htf_fib50_is_midpoint():
+    df  = _make_1h(300)
+    ctx = get_htf_context(df)
+    # fib50 should be between min and max of the data
+    assert df["low"].min() <= ctx["fib50"] <= df["high"].max()
+
+
+# ── LTF signal ────────────────────────────────────────────────────────────────
+
+def test_ltf_flat_on_neutral_htf():
+    ctx = {"bias": "neutral", "poi_zones": [], "fib50": 0.0,
+           "liquidity_highs": [], "liquidity_lows": []}
+    sig = get_ltf_signal(_make_5m(), ctx)
     assert sig["action"] == "FLAT"
-    assert sig["sl"] is None
-    assert sig["tp"] is None
 
 
-def test_get_signal_latest_returns_valid_keys():
-    df = _make_df(300)
-    sig = get_signal_latest(df)
+def test_ltf_flat_on_short_df():
+    ctx = {"bias": "bullish", "poi_zones": [(40000, 55000, "OB")],
+           "fib50": 52000.0, "liquidity_highs": [60000.0], "liquidity_lows": []}
+    sig = get_ltf_signal(_make_5m(10), ctx)
+    assert sig["action"] == "FLAT"
+
+
+def test_ltf_signal_returns_valid_keys():
+    ctx = get_htf_context(_make_1h(300))
+    sig = get_ltf_signal(_make_5m(600), ctx)
     assert "action" in sig
     assert sig["action"] in ("LONG", "FLAT")
     if sig["action"] == "LONG":
         assert sig["sl"] is not None
-        assert sig["tp"] is not None
-        assert sig["tp"] > sig["sl"]
+        assert sig["tp1"] > sig["sl"]
+        assert sig["tp2"] > sig["tp1"]
+        assert sig["tp_runner"] >= sig["tp2"]
+
+
+# ── Combined wrapper ──────────────────────────────────────────────────────────
+
+def test_get_signal_latest_returns_valid_keys():
+    sig = get_signal_latest(_make_1h(300), _make_5m(600))
+    assert "action" in sig
+    assert sig["action"] in ("LONG", "FLAT")
+
+
+def test_get_signal_latest_flat_on_tiny_data():
+    sig = get_signal_latest(_make_1h(5), _make_5m(5))
+    assert sig["action"] == "FLAT"

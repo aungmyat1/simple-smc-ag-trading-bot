@@ -76,6 +76,35 @@ def place_long(qty: float, sl: float, tp: float) -> dict:
     return resp["result"]
 
 
+def close_partial(qty: float) -> dict:
+    """
+    Reduce position by `qty` (partial close, reduce-only market order).
+    No-op (logs only) when LIVE_TRADING=False.
+    """
+    if not config.LIVE_TRADING:
+        log.info("[PAPER] PARTIAL CLOSE qty=%.4f", qty)
+        return {"orderId": "PAPER-PARTIAL", "qty": qty}
+
+    pos = get_open_position()
+    if pos is None:
+        return {}
+
+    side = "Sell" if pos["side"] == "Buy" else "Buy"
+    sess = _get_session()
+    resp = sess.place_order(
+        category="linear",
+        symbol=config.SYMBOL,
+        side=side,
+        orderType="Market",
+        qty=str(round(qty, 4)),
+        reduceOnly=True,
+        timeInForce="IOC",
+        positionIdx=0,
+    )
+    log.info("PARTIAL CLOSE placed: %s", resp)
+    return resp["result"]
+
+
 def close_position() -> dict:
     """
     Market-close the open BTCUSDT position.

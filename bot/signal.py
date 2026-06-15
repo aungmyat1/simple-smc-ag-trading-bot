@@ -1,19 +1,27 @@
 """
-SMC signal detector — Trial 3.
+SMC signal — Trial 3: 1H POI → 5M execution.
 
-Pipeline per bar:
-  1. Trend filter  : close > EMA200 → bullish regime only
-  2. Order Block   : find most recent bullish OB in last OB_MAX_AGE_BARS bars
-  3. Price in OB   : current bar overlaps the OB zone
-  4. Sweep         : recent bar swept the swing low (pierced + closed above)
-  5. CHoCH         : after the sweep, a swing high was broken (trend flip confirmed)
-  → LONG with SL below sweep wick, TP at TARGET_R × risk
+Two-stage pipeline
+──────────────────
+Stage 1 (HTF — 1H):
+  get_htf_context(df_1h) → bias, POI zones, Fibonacci 50%, liquidity pools
+
+Stage 2 (LTF — 5M):
+  get_ltf_signal(df_5m, htf_context) → LONG/FLAT, sl, tp1, tp2, tp_runner
+
+Entry logic (LONG, all conditions AND-ed):
+  1. 1H bias = bullish (close > EMA200, EMA slope positive)
+  2. Current 5M price inside a 1H bullish POI (OB or FVG)
+  3. Current 5M price ≤ Fibonacci 50% level (discount zone)
+  4. 5M liquidity sweep of recent swing low (pierced + closed above)
+  5. 5M MSS/CHoCH: after sweep, a 5M swing high was broken
+  6. Price retracing into a fresh 5M bullish OB or FVG (execution zone)
 
 Public API
-----------
-add_indicators(df)         → df with ema200, atr, swing_high, swing_low columns
-get_signals(df)            → df with 'signal', 'sl', 'tp' columns  (for backtest)
-get_signal_latest(df)      → dict(action, sl, tp)                  (for runner)
+──────────
+  get_htf_context(df_1h)              → dict
+  get_ltf_signal(df_5m, htf_context)  → dict
+  get_signal_latest(df_1h, df_5m)     → dict  (runner entry point)
 """
 from __future__ import annotations
 
@@ -23,181 +31,326 @@ import pandas as pd
 from bot import config
 
 
-# ── Indicators ────────────────────────────────────────────────────────────────
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-    df["ema200"] = df["close"].ewm(span=config.HTF_EMA, adjust=False).mean()
 
-    # True Range → ATR
-    prev_close = df["close"].shift(1)
+def _atr(df: pd.DataFrame, period: int = config.ATR_PERIOD) -> pd.Series:
+    prev_c = df["close"].shift(1)
     tr = pd.concat(
         [df["high"] - df["low"],
-         (df["high"] - prev_close).abs(),
-         (df["low"]  - prev_close).abs()],
+         (df["high"] - prev_c).abs(),
+         (df["low"]  - prev_c).abs()],
         axis=1,
     ).max(axis=1)
-    df["atr"] = tr.ewm(span=config.ATR_PERIOD, adjust=False).mean()
-
-    lb = config.SWING_LOOKBACK
-    # shift(1) so bar i only sees data before itself (no lookahead)
-    df["swing_high"] = df["high"].rolling(lb).max().shift(1)
-    df["swing_low"]  = df["low"].rolling(lb).min().shift(1)
-
-    return df
+    return tr.ewm(span=period, adjust=False).mean()
 
 
-# ── Order Block detection (vectorised pre-pass) ───────────────────────────────
+def _swing_high(high: np.ndarray, lookback: int) -> np.ndarray:
+    """Rolling max of previous `lookback` bars (no lookahead)."""
+    result = np.full(len(high), np.nan)
+    for i in range(lookback, len(high)):
+        result[i] = np.max(high[i - lookback:i])
+    return result
 
-def _precompute_obs(df: pd.DataFrame) -> list[tuple[float, float] | None]:
+
+def _swing_low(low: np.ndarray, lookback: int) -> np.ndarray:
+    """Rolling min of previous `lookback` bars (no lookahead)."""
+    result = np.full(len(low), np.nan)
+    for i in range(lookback, len(low)):
+        result[i] = np.min(low[i - lookback:i])
+    return result
+
+
+# ── Stage 1: HTF context (1H) ─────────────────────────────────────────────────
+
+def _htf_bias(df: pd.DataFrame) -> str:
     """
-    Return ob_zones list where ob_zones[i] = (ob_low, ob_high) if bar i is
-    the bearish candle of a valid bullish OB, else None.
+    'bullish' if close > EMA200 and EMA200 has been rising for 5 bars.
+    'bearish' if close < EMA200 and falling.
+    'neutral' otherwise.
+    """
+    ema = _ema(df["close"], config.HTF_EMA)
+    last_close = df["close"].iloc[-1]
+    last_ema   = ema.iloc[-1]
+    slope_pos  = ema.iloc[-1] > ema.iloc[-6]   # rising over last 5 bars
+    slope_neg  = ema.iloc[-1] < ema.iloc[-6]
+
+    if last_close > last_ema and slope_pos:
+        return "bullish"
+    if last_close < last_ema and slope_neg:
+        return "bearish"
+    return "neutral"
+
+
+def _htf_poi_zones(df: pd.DataFrame) -> list[tuple[float, float, str]]:
+    """
+    Return list of active bullish POI zones: (low, high, kind).
+    kind = "OB" or "FVG".
 
     Bullish OB at bar j:
-      - bar j is bearish (close < open)
-      - bar j+1 is displacement: range >= OB_DISPLACEMENT_MULT * atr[j]
-        AND close[j+1] > swing_high[j+1]
+      - bar j is bearish
+      - bar j+1 range >= HTF_OB_DISPLACEMENT × ATR
+      - bar j+1 close > rolling swing high
+
+    Bullish FVG between bar i-2 and bar i:
+      - bar[i].low > bar[i-2].high  → gap above bar[i-2]
     """
     close      = df["close"].values
     open_      = df["open"].values
     high       = df["high"].values
     low        = df["low"].values
-    atr        = df["atr"].values
-    swing_high = df["swing_high"].values
+    atr_vals   = _atr(df).values
+    swing_h    = _swing_high(high, config.HTF_SWING_LOOKBACK)
     n          = len(df)
+    age_limit  = max(0, n - config.HTF_OB_MAX_AGE)
+    zones: list[tuple[float, float, str]] = []
 
-    ob_zones: list[tuple[float, float] | None] = [None] * n
-
-    for j in range(n - 1):
-        if close[j] >= open_[j]:          # must be bearish
+    # Order blocks
+    for j in range(age_limit, n - 1):
+        if close[j] >= open_[j]:    # must be bearish candle
             continue
         j1 = j + 1
         bar_range = high[j1] - low[j1]
-        if np.isnan(atr[j]) or bar_range < config.OB_DISPLACEMENT_MULT * atr[j]:
+        if np.isnan(atr_vals[j]) or bar_range < config.HTF_OB_DISPLACEMENT * atr_vals[j]:
             continue
-        if np.isnan(swing_high[j1]) or close[j1] <= swing_high[j1]:
+        if np.isnan(swing_h[j1]) or close[j1] <= swing_h[j1]:
             continue
         ob_low  = min(open_[j], close[j])
         ob_high = max(open_[j], close[j])
-        ob_zones[j] = (ob_low, ob_high)
+        zones.append((ob_low, ob_high, "OB"))
 
-    return ob_zones
+    # Fair Value Gaps (bullish: low[i] > high[i-2])
+    for i in range(age_limit + 2, n):
+        fvg_low  = high[i - 2]
+        fvg_high = low[i]
+        if fvg_high > fvg_low:
+            zones.append((fvg_low, fvg_high, "FVG"))
+
+    return zones
 
 
-# ── Per-bar signal logic ───────────────────────────────────────────────────────
+def _htf_fib50(df: pd.DataFrame) -> float:
+    """Midpoint of the range over last HTF_SWING_LOOKBACK×5 bars."""
+    lb = min(config.HTF_SWING_LOOKBACK * 5, len(df))
+    window = df.iloc[-lb:]
+    swing_h = window["high"].max()
+    swing_l = window["low"].min()
+    return (swing_h + swing_l) / 2.0
 
-def _signal_at(
-    df: pd.DataFrame,
-    ob_zones: list,
-    i: int,
-) -> tuple[bool, float | None, float | None]:
+
+def _htf_liquidity(df: pd.DataFrame) -> tuple[list[float], list[float]]:
     """
-    Return (is_long, sl, tp) for bar i.
-    Uses look-back only — no future data.
+    Find equal highs / equal lows on 1H within HTF_EQUAL_LEVEL_TOL.
+    Returns (liquidity_highs, liquidity_lows).
     """
-    close = df["close"].values
-    high  = df["high"].values
-    low   = df["low"].values
-    ema   = df["ema200"].values
+    lb   = min(config.HTF_SWING_LOOKBACK * 3, len(df))
+    highs = df["high"].iloc[-lb:].values
+    lows  = df["low"].iloc[-lb:].values
+    tol   = config.HTF_EQUAL_LEVEL_TOL
 
-    # 1. Trend filter
-    if close[i] <= ema[i]:
-        return False, None, None
+    def _cluster(levels: np.ndarray) -> list[float]:
+        seen: list[float] = []
+        result: list[float] = []
+        for v in sorted(levels):
+            matched = next((s for s in seen if abs(v - s) / s <= tol), None)
+            if matched is None:
+                seen.append(v)
+            else:
+                result.append((v + matched) / 2.0)
+        return result
 
-    # 2. Find most recent active bullish OB whose zone overlaps current bar
-    ob_zone = None
-    age_limit = max(config.STARTUP_CANDLE, i - config.OB_MAX_AGE_BARS)
-    for j in range(i - 1, age_limit, -1):
-        if ob_zones[j] is None:
+    return _cluster(highs), _cluster(lows)
+
+
+def get_htf_context(df_1h: pd.DataFrame) -> dict:
+    """
+    Scan 1H dataframe and return bias, POI zones, fib50, and liquidity pools.
+    Requires at least HTF_BARS rows for reliable output.
+    """
+    if len(df_1h) < max(config.HTF_EMA, config.HTF_SWING_LOOKBACK * 5):
+        return {
+            "bias": "neutral",
+            "poi_zones": [],
+            "fib50": 0.0,
+            "liquidity_highs": [],
+            "liquidity_lows": [],
+        }
+
+    liq_highs, liq_lows = _htf_liquidity(df_1h)
+    return {
+        "bias":             _htf_bias(df_1h),
+        "poi_zones":        _htf_poi_zones(df_1h),
+        "fib50":            _htf_fib50(df_1h),
+        "liquidity_highs":  liq_highs,
+        "liquidity_lows":   liq_lows,
+    }
+
+
+# ── Stage 2: LTF signal (5M) ──────────────────────────────────────────────────
+
+def _ltf_ob_zones(df: pd.DataFrame) -> list[tuple[float, float]]:
+    """
+    Bullish 5M OBs formed in last LTF_OB_MAX_AGE bars.
+    Same rule as HTF but using LTF params.
+    """
+    close      = df["close"].values
+    open_      = df["open"].values
+    high       = df["high"].values
+    low        = df["low"].values
+    atr_vals   = _atr(df).values
+    swing_h    = _swing_high(high, config.LTF_SWING_LOOKBACK)
+    n          = len(df)
+    age_limit  = max(0, n - config.LTF_OB_MAX_AGE)
+    zones: list[tuple[float, float]] = []
+
+    for j in range(age_limit, n - 1):
+        if close[j] >= open_[j]:
             continue
-        ob_low, ob_high = ob_zones[j]
-        if low[i] <= ob_high and high[i] >= ob_low:
-            ob_zone = (ob_low, ob_high)
-            break
+        j1 = j + 1
+        bar_range = high[j1] - low[j1]
+        if np.isnan(atr_vals[j]) or bar_range < config.HTF_OB_DISPLACEMENT * atr_vals[j]:
+            continue
+        if np.isnan(swing_h[j1]) or close[j1] <= swing_h[j1]:
+            continue
+        zones.append((min(open_[j], close[j]), max(open_[j], close[j])))
 
-    if ob_zone is None:
-        return False, None, None
+    return zones
 
-    # 3. Liquidity sweep in last SWEEP_LOOKBACK bars
-    sweep_low  = None
+
+def _ltf_fvg_zones(df: pd.DataFrame) -> list[tuple[float, float]]:
+    """Bullish FVGs in last LTF_OB_MAX_AGE bars."""
+    high = df["high"].values
+    low  = df["low"].values
+    n    = len(df)
+    age_limit = max(2, n - config.LTF_OB_MAX_AGE)
+    zones: list[tuple[float, float]] = []
+    for i in range(age_limit, n):
+        fvg_low  = high[i - 2]
+        fvg_high = low[i]
+        if fvg_high > fvg_low:
+            zones.append((fvg_low, fvg_high))
+    return zones
+
+
+def _find_sweep(low: np.ndarray, close: np.ndarray, n: int) -> tuple[int, float] | tuple[None, None]:
+    """
+    Scan backward from bar n-1 over LTF_SWEEP_LOOKBACK bars for a liquidity sweep.
+    Sweep: low[k] < ref_low * (1 - pierce) AND close[k] >= ref_low.
+    ref_low = rolling min of LTF_SWING_LOOKBACK bars before the sweep window.
+
+    Returns (sweep_bar_idx, sweep_wick_low) or (None, None).
+    """
+    lb         = config.LTF_SWEEP_LOOKBACK
+    sl         = config.LTF_SWING_LOOKBACK
+    start      = max(0, n - lb)
+    ref_start  = max(0, start - sl)
+    pierce     = config.LTF_SWEEP_PIERCE
+
+    if ref_start >= start:
+        return None, None
+
+    ref_low = np.min(low[ref_start:start])
+    threshold = ref_low * (1.0 - pierce)
+
     sweep_idx  = None
-    look_start = max(0, i - config.SWEEP_LOOKBACK)
-
-    # Reference: the swing low of the 20 bars before the lookback window
-    ref_start = max(0, look_start - config.SWING_LOOKBACK)
-    ref_low   = np.min(low[ref_start:look_start + 1]) if look_start > ref_start else None
-
-    if ref_low is None:
-        return False, None, None
-
-    for k in range(look_start, i + 1):
-        if low[k] < ref_low * (1 - config.SWEEP_MIN_PIERCE) and close[k] >= ref_low:
-            sweep_low = low[k]
+    sweep_low  = None
+    for k in range(start, n):
+        if low[k] < threshold and close[k] >= ref_low:
             sweep_idx = k
-            # keep the most recent sweep
+            sweep_low = low[k]
 
+    return sweep_idx, sweep_low
+
+
+def _has_choch(high: np.ndarray, close: np.ndarray, sweep_idx: int, n: int) -> bool:
+    """True if close[n-1] broke the max high seen between sweep_idx and n-1."""
+    if sweep_idx is None or sweep_idx >= n - 1:
+        return False
+    post_sweep_max = np.max(high[sweep_idx:n - 1])
+    return close[n - 1] > post_sweep_max
+
+
+def get_ltf_signal(df_5m: pd.DataFrame, htf_context: dict) -> dict:
+    """
+    Check LTF entry conditions given HTF context.
+    Returns dict with 'action', 'sl', 'tp1', 'tp2', 'tp_runner'.
+    """
+    _flat = {"action": "FLAT", "sl": None, "tp1": None, "tp2": None, "tp_runner": None}
+
+    if len(df_5m) < config.LTF_BARS // 2:
+        return _flat
+
+    # 1. HTF bias
+    if htf_context.get("bias") != "bullish":
+        return _flat
+
+    high  = df_5m["high"].values
+    low   = df_5m["low"].values
+    close = df_5m["close"].values
+    n     = len(df_5m)
+    price = close[n - 1]
+
+    # 2. Price inside a 1H bullish POI zone
+    in_poi = any(
+        low[n - 1] <= z_high and high[n - 1] >= z_low
+        for z_low, z_high, _ in htf_context.get("poi_zones", [])
+    )
+    if not in_poi:
+        return _flat
+
+    # 3. Price in discount (below 1H 50% Fib)
+    fib50 = htf_context.get("fib50", 0.0)
+    if fib50 > 0 and price > fib50:
+        return _flat
+
+    # 4. Liquidity sweep of recent 5M swing low
+    sweep_idx, sweep_low = _find_sweep(low, close, n)
     if sweep_idx is None:
-        return False, None, None
+        return _flat
 
-    # 4. CHoCH: after the sweep, close broke a recent swing high
-    if sweep_idx >= i:
-        return False, None, None
-    post_sweep_high = np.max(high[sweep_idx:i]) if sweep_idx < i else 0.0
-    if close[i] <= post_sweep_high:
-        return False, None, None
+    # 5. 5M CHoCH / MSS after the sweep
+    if not _has_choch(high, close, sweep_idx, n):
+        return _flat
 
-    # All conditions met → LONG
-    sl    = sweep_low * (1.0 - 0.001)   # 0.1% below the sweep wick
-    risk  = close[i] - sl
+    # 6. Price retracing into a fresh 5M OB or FVG (execution zone)
+    ob_zones  = _ltf_ob_zones(df_5m)
+    fvg_zones = _ltf_fvg_zones(df_5m)
+    entry_zones = ob_zones + fvg_zones
+    in_entry_zone = any(
+        low[n - 1] <= z_high and high[n - 1] >= z_low
+        for z_low, z_high in entry_zones
+    )
+    if not in_entry_zone:
+        return _flat
+
+    # All conditions met — build trade plan
+    sl   = sweep_low * (1.0 - 0.001)   # 0.1% below wick
+    risk = price - sl
     if risk <= 0:
-        return False, None, None
-    tp    = close[i] + risk * config.TARGET_R
+        return _flat
 
-    return True, sl, tp
+    tp1 = price + risk * config.TP1_R
+    tp2 = price + risk * config.TP2_R
 
+    # Runner TP = nearest 1H liquidity high above entry
+    liq_highs = [h for h in htf_context.get("liquidity_highs", []) if h > price]
+    tp_runner  = min(liq_highs) if liq_highs else price + risk * config.TARGET_R
 
-# ── Public: vectorised signal column (used by backtest) ──────────────────────
-
-def get_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds columns signal (1=LONG, 0=flat), sl, tp to df.
-    Signals reference bar close; backtest enters at next bar open.
-    """
-    df = add_indicators(df).copy()
-    ob_zones = _precompute_obs(df)
-
-    signals = np.zeros(len(df), dtype=int)
-    sl_arr  = np.full(len(df), np.nan)
-    tp_arr  = np.full(len(df), np.nan)
-
-    for i in range(config.STARTUP_CANDLE, len(df)):
-        is_long, sl, tp = _signal_at(df, ob_zones, i)
-        if is_long:
-            signals[i] = 1
-            sl_arr[i]  = sl
-            tp_arr[i]  = tp
-
-    df["signal"] = signals
-    df["sl"]     = sl_arr
-    df["tp"]     = tp_arr
-    return df
+    return {
+        "action":    "LONG",
+        "sl":        sl,
+        "tp1":       tp1,
+        "tp2":       tp2,
+        "tp_runner": tp_runner,
+    }
 
 
-# ── Public: latest-bar signal (used by runner) ────────────────────────────────
+# ── Public wrapper for runner ─────────────────────────────────────────────────
 
-def get_signal_latest(df: pd.DataFrame) -> dict:
-    """
-    Compute signal for the last complete bar.
-    df must already have all required columns (pass raw OHLCV).
-    Returns {'action': 'LONG'|'FLAT', 'sl': float|None, 'tp': float|None}
-    """
-    df = add_indicators(df)
-    if len(df) < config.STARTUP_CANDLE:
-        return {"action": "FLAT", "sl": None, "tp": None}
-
-    ob_zones = _precompute_obs(df)
-    i        = len(df) - 1
-    is_long, sl, tp = _signal_at(df, ob_zones, i)
-    return {"action": "LONG" if is_long else "FLAT", "sl": sl, "tp": tp}
+def get_signal_latest(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
+    """Entry point for the runner. Calls both stages."""
+    htf_context = get_htf_context(df_1h)
+    return get_ltf_signal(df_5m, htf_context)
