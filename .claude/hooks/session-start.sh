@@ -1,9 +1,6 @@
 #!/bin/bash
-# SessionStart hook — install Python dependencies so tests, the backtest gate,
-# and the bot import cleanly in Claude Code on the web.
-#
-# Synchronous (the session waits for this to finish) and idempotent
-# (safe to run on every session start). Web-only: a no-op locally.
+# SessionStart hook — install Python deps so tests and the backtest gate
+# work in Claude Code on the web. Web-only, idempotent, non-interactive.
 set -euo pipefail
 
 # Only run in the remote (Claude Code on the web) environment.
@@ -13,9 +10,12 @@ fi
 
 cd "${CLAUDE_PROJECT_DIR:-.}"
 
+echo "[session-start] installing Python dependencies…"
 python3 -m pip install --quiet --disable-pip-version-check -r requirements.txt
 
-# Let `import bot` / `python scripts/*.py` resolve from the repo root.
+# Let `import bot` / `python -m bot.runner` resolve from the repo root.
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo 'export PYTHONPATH="."' >> "$CLAUDE_ENV_FILE"
 fi
+
+echo "[session-start] done."
