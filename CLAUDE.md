@@ -38,23 +38,25 @@ Architecture goal: Data → Signal → Risk → Execute → Log → Alert. Nothi
 
 | Layer | File | Purpose |
 |---|---|---|
-| Signal | `bot/signal.py` | Detects entry conditions from OHLCV |
-| Risk | `bot/risk.py` | Position size, daily loss limit, max DD |
-| Execution | `bot/executor.py` | Places/cancels orders on Bybit |
-| Logger | `bot/logger.py` | Appends trade to `data/trades.csv` |
-| Alerts | `bot/alerts.py` | Telegram notifications |
-| Runner | `bot/runner.py` | Main loop: fetch → signal → risk → execute |
-| Config | `bot/config.py` | All constants in one place (no hardcoded values) |
+| Signal | `smc_bot/structure.py` | 1H bias: HH+HL → bullish / LL+LH → bearish |
+| | `smc_bot/poi.py` | 1H Order Block + FVG zone detection |
+| | `smc_bot/liquidity.py` | 5M sweep: swing pierced, closed back above |
+| | `smc_bot/confirmation.py` | 5M CHoCH: close breaks ref high after sweep |
+| Risk | `smc_bot/risk.py` | Position sizing + daily/drawdown/consec-loss guards |
+| Execution | `smc_bot/executor.py` | Bybit order placement (signal_only_mode by default) |
+| Data | `smc_bot/data.py` | OHLCV candle fetching from Bybit |
+| Runner | `smc_bot/bot.py` | Main loop: balance → guards → signal → (place) |
+| Config | `smc_bot/config.yaml` | All constants; read by `bot.py` and `scripts/backtest.py` |
 
 ---
 
-## §3 — CURRENT STRATEGY (BOT v1)
+## §3 — CURRENT STRATEGY (Trial 4: SMC Sniper via smc_bot/)
 
-**BTC/USDT:USDT perpetual · Bybit · 15m · 1× leverage**
+**BTC/USDT:USDT perpetual · Bybit · 1H+5M · 1× leverage**
 
-> STATUS: Phase-0 FAILED (2026-06-15). EMA50/200 + swing breakout + retest.
-> Gross PF 1.02, net PF 0.68 after fees. Fee = 0.31R/trade destroys marginal edge.
-> Architecture is reusable. Signal family needs to change.
+> STATUS: Phase-0 PENDING (2026-06-15). SMC Sniper: 1H swing bias + OB/FVG POI →
+> 5M liquidity sweep + CHoCH. Single-TP exit at 2R. Scored by scripts/backtest.py
+> using smc_bot/ signal chain (not _archive).
 
 **Fee constraint (non-negotiable):**
 - Bybit taker: 0.06% per side = 0.12% round trip
@@ -137,31 +139,35 @@ Alert events:
 
 ```
 simple-smc-ag-trading-bot/
-  bot/
-    config.py       # all constants; import everywhere
-    signal.py       # indicator computation + entry conditions
-    risk.py         # position sizing + guards
-    executor.py     # Bybit order placement
-    logger.py       # trades.csv append
-    alerts.py       # Telegram
-    runner.py       # main loop
+  smc_bot/
+    config.yaml       # all constants — read by bot.py and scripts/backtest.py
+    structure.py      # get_bias(): 1H swing structure → bullish/bearish/neutral
+    poi.py            # get_pois(), price_in_poi(): 1H OB + FVG zones
+    liquidity.py      # get_sweep(): 5M stop-hunt of prior swing
+    confirmation.py   # get_choch(): 5M CHoCH after sweep
+    risk.py           # calc_qty(), trading_allowed() — pure guards
+    executor.py       # Bybit order placement (signal_only_mode blocks real orders)
+    data.py           # OHLCV candle fetching from Bybit
+    bot.py            # main loop: balance → guards → signal → (place)
+  _archive/
+    bot_v1/           # Trial 1+2 EMA code — read-only, never re-import in new code
   data/
-    trades.csv      # append-only trade journal
-    cache/          # OHLCV parquet files
+    cache/            # OHLCV parquet files (BTCUSDT_60m.parquet, BTCUSDT_5m.parquet)
   scripts/
-    backtest.py     # Phase-0 gate (n >= 50, net PF > 1.0)
-    fetch_data.py   # download OHLCV from Bybit public API
+    backtest.py       # Phase-0 gate — imports smc_bot/, NOT _archive
+    fetch_data.py     # download OHLCV from Bybit public API
   tests/
-    test_signal.py
-    test_risk.py
-    test_backtest.py
+    test_signal.py    # detector unit tests (structure/poi/liquidity/confirmation)
+    test_smc_risk.py  # risk guard tests
+    test_smc_state.py # BotState persistence tests
+    test_signal_parity.py  # archive vs live path parity (divergence documented)
   docs/
-    VERDICT_LOG.md  # one row per trial — never delete entries
-    SIGNAL_SPEC.md  # current signal spec (locked before backtest)
-  logs/             # runtime logs (gitignored)
-  .env              # secrets (gitignored)
-  .env.example      # template (committed, no values)
-  CLAUDE.md         # this file
+    VERDICT_LOG.md    # one row per trial — never delete entries
+    SIGNAL_SPEC.md    # current signal spec (locked before backtest)
+  logs/               # runtime logs (gitignored)
+  .env                # secrets (gitignored)
+  .env.example        # template (committed, no values)
+  CLAUDE.md           # this file
 ```
 
 ---

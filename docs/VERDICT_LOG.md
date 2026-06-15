@@ -12,7 +12,9 @@ Fee model: Bybit taker 0.06%/side = 0.12% round trip.
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | 2026-06-15 | EMA50/200 trend + 20-bar swing break + retest (tol 0.5×ATR, valid 10 bars) | 15m | 1570 | 1.0233 | 0.313 | 0.6834 | 29.0% | **FAIL** |
 | 2 | 2026-06-15 | EMA50/200 trend + 20-bar swing breakout-only (no retest) | 15m | 1333 | 0.9932 | 0.348 | 0.6399 | 28.4% | **FAIL** |
-| 3 | 2026-06-15 | SMC Sniper (1BullBear Ep15A): London/NY session filter + 1H POI (OB/FVG, discount) → 5M inducement sweep + displacement (≥1.5×ATR) + CHoCH + 5M OB/FVG retrace. Partials: 50%@2R (→BE) / 25%@3R / 25%@HTF-liq. Min R:R=2. Consec-loss guard=2. | 1H+5M | TBD | — | — | — | — | **PENDING** |
+| 3 | 2026-06-15 | SMC Sniper (1BullBear Ep15A): London/NY session filter + 1H POI (OB/FVG, discount) → 5M inducement sweep + displacement (≥1.5×ATR) + CHoCH + 5M OB/FVG retrace. Partials: 50%@2R (→BE) / 25%@3R / 25%@HTF-liq. Min R:R=2. Consec-loss guard=2. | 1H+5M | TBD | — | — | — | — | **ABANDONED** (backtest scored _archive EMA chain not smc_bot/) |
+| 4 | 2026-06-15 | SMC Sniper via smc_bot/ chain: 1H swing bias (HH+HL) + 1H OB/FVG POI → 5M sweep (swing pierce+close) + CHoCH. Single exit: 2R TP / SL=wick−0.1%. Config: smc_bot/config.yaml. Backtest: scripts/backtest.py (seam fixed, no _archive). | 1H+5M | 301 | 0.9366 | 0.2498 | 0.6567 | 31.9% | **FAIL** (gross PF < 1.0 — no edge before fees; signal family dead on 5M) |
+| 5 | PRE-REGISTERED | SMC Sniper H1 variant: same smc_bot/ chain (HH+HL bias + OB/FVG POI + sweep + CHoCH) but HTF=4H, LTF=1H. Hypothesis: wider ATR on 1H (~0.9% vs 0.3%) drops fee ratio from ~0.31R to ~0.09R/trade — same structural signal, fee floor evaporates. Single 2R exit. Run on same 2yr holdout data once Trial 4 verdict is logged. | 4H+1H | PRE-REG | — | — | — | — | **PRE-REGISTERED** |
 
 ---
 
