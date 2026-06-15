@@ -10,9 +10,12 @@ bybit:
                 # Keys: BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET from .env
 
 risk:
-  risk_pct: 0.01    # 1% of balance per trade
-  target_r: 2.0     # 2R fixed TP
-  sl_buffer: 0.001  # 0.1% pad below/above sweep wick for SL
+  risk_pct: 0.01          # 1% of balance per trade
+  target_r: 2.0           # 2R fixed TP
+  sl_buffer: 0.001        # 0.1% pad below/above sweep wick for SL
+  max_daily_loss: 0.02    # 2% — halt trading for the rest of the day
+  max_drawdown: 0.10      # 10% from peak — kill switch
+  max_consecutive_losses: 2  # halt after N losses in a row (resets on any win)
 
 structure:
   swing_n: 5        # bars each side to confirm a swing high/low (1H)
@@ -32,6 +35,8 @@ confirmation:
 data:
   htf_limit: 150    # 1H candles to fetch
   ltf_limit: 100    # 5M candles to fetch
+
+signal_only_mode: true   # true = log signals, never execute orders; flip to false for demo execution
 
 logging:
   file: logs/smc_bot.log

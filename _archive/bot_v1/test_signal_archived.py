@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bot.signal import get_htf_context, get_ltf_signal, get_signal_latest
+from _archive.bot_v1.signal import get_htf_context, get_ltf_signal, get_signal_latest
 
 
 def _make_df(n: int, freq: str = "1h", seed: int = 42, bullish: bool = True) -> pd.DataFrame:

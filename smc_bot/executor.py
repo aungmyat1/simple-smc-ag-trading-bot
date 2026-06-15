@@ -107,6 +107,22 @@ def place_order(
         raise
 
 
+def get_last_closed_pnl(session: HTTP, symbol: str) -> float | None:
+    """
+    Return the realized PnL of the most recent closed trade, or None if unavailable.
+    Positive = win, negative = loss.
+    """
+    try:
+        resp = session.get_closed_pnl(category="linear", symbol=symbol, limit=1)
+        items = resp.get("result", {}).get("list", [])
+        if items:
+            return float(items[0].get("closedPnl", 0))
+        return None
+    except Exception as exc:
+        log.error("get_last_closed_pnl failed: %s", exc)
+        return None
+
+
 def close_position(session: HTTP, symbol: str) -> dict:
     """Close the open position at market (reduce-only)."""
     pos = get_position(session, symbol)

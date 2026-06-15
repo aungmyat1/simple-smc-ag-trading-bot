@@ -1,7 +1,7 @@
 """Unit tests for bot/risk.py."""
 import pytest
 
-from bot.risk import calc_position_size, daily_loss_breached, drawdown_breached, trading_allowed
+from _archive.bot_v1.risk import calc_position_size, daily_loss_breached, drawdown_breached, trading_allowed
 
 
 def test_position_size_basic():
@@ -45,13 +45,13 @@ def test_trading_allowed_blocked_on_drawdown():
 
 
 def test_consecutive_losses_not_breached():
-    from bot.risk import consecutive_losses_breached
+    from _archive.bot_v1.risk import consecutive_losses_breached
     assert not consecutive_losses_breached(0)
     assert not consecutive_losses_breached(1)
 
 
 def test_consecutive_losses_breached():
-    from bot.risk import consecutive_losses_breached
+    from _archive.bot_v1.risk import consecutive_losses_breached
     assert consecutive_losses_breached(2)
     assert consecutive_losses_breached(3)
 

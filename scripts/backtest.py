@@ -32,8 +32,8 @@ import pandas as pd
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from bot import config
-from bot.signal import get_htf_context, get_ltf_signal
+from _archive.bot_v1 import config
+from _archive.bot_v1.signal import get_htf_context, get_ltf_signal
 
 TAKER_FEE  = 0.0006   # 0.06% per side
 ROUND_TRIP = TAKER_FEE * 2
