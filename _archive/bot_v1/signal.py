@@ -28,7 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from bot import config
+from _archive.bot_v1 import config
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
