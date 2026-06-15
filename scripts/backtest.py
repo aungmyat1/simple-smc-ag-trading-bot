@@ -401,13 +401,13 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
 
 # ── Phase-C report ────────────────────────────────────────────────────────────
 
-def print_report(stats: dict) -> None:
+def print_report(stats: dict, run_label: str = "Trial 4", htf_label: str = "1H", ltf_label: str = "5M") -> None:
     n, gross_pf, net_pf = stats["n"], stats["gross_pf"], stats["net_pf"]
     print("\n" + "=" * 60)
-    print("  SMC Bot — Phase-0 Gate  (Trial 4: smc_bot/ chain)")
+    print(f"  SMC Bot — Phase-0 Gate  ({run_label}: smc_bot/ chain)")
     print("=" * 60)
-    print(f"  Signal  : 1H swing bias + OB/FVG POI → 5M sweep + CHoCH")
-    print(f"  Symbol  : {SYMBOL}  HTF=1H  LTF=5M  (long-only)")
+    print(f"  Signal  : {htf_label} swing bias + OB/FVG POI → {ltf_label} sweep + CHoCH")
+    print(f"  Symbol  : {SYMBOL}  HTF={htf_label}  LTF={ltf_label}  (long-only)")
     print(f"  Exit    : single TP={TARGET_R}R  SL=sweep-wick−{SL_BUF*100:.1f}%")
     print(f"  Fee     : Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip")
     print("-" * 60)
@@ -551,7 +551,9 @@ def main() -> None:
     parser.add_argument("--ltf", default=str(ROOT / "data" / "cache" / f"{SYMBOL}_5m.parquet"))
     parser.add_argument("--csv", default=None)
     parser.add_argument("--max-bars", type=int, default=None,
-                        help="Limit 5M bars processed (profiling only — do NOT use for real trials)")
+                        help="Limit LTF bars processed (profiling only — do NOT use for real trials)")
+    parser.add_argument("--run-label", default=None,
+                        help="e.g. 'Trial 5' — appears in the report header")
     args = parser.parse_args()
 
     for label, path in [("HTF (1H)", args.htf), ("LTF (5M)", args.ltf)]:
@@ -575,9 +577,20 @@ def main() -> None:
     print("Precomputing signal arrays …", flush=True)
     _precompute(df_1h, df_5m)
 
+    def _tf_label(path: str) -> str:
+        stem = Path(path).stem.rsplit("_", 1)
+        if len(stem) == 2:
+            mins = int(stem[1].replace("m", ""))
+            return f"{mins // 60}H" if mins >= 60 else f"{mins}m"
+        return "?"
+
+    htf_label = _tf_label(args.htf)
+    ltf_label = _tf_label(args.ltf)
+    run_label = args.run_label or "Trial 4"
+
     print("Running Phase-C backtest …", flush=True)
     stats = run_backtest(df_1h, df_5m)
-    print_report(stats)
+    print_report(stats, run_label=run_label, htf_label=htf_label, ltf_label=ltf_label)
     sys.stdout.flush()
 
     print("Running Phase-D funnel …", flush=True)

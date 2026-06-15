@@ -14,7 +14,7 @@ Fee model: Bybit taker 0.06%/side = 0.12% round trip.
 | 2 | 2026-06-15 | EMA50/200 trend + 20-bar swing breakout-only (no retest) | 15m | 1333 | 0.9932 | 0.348 | 0.6399 | 28.4% | **FAIL** |
 | 3 | 2026-06-15 | SMC Sniper (1BullBear Ep15A): London/NY session filter + 1H POI (OB/FVG, discount) → 5M inducement sweep + displacement (≥1.5×ATR) + CHoCH + 5M OB/FVG retrace. Partials: 50%@2R (→BE) / 25%@3R / 25%@HTF-liq. Min R:R=2. Consec-loss guard=2. | 1H+5M | TBD | — | — | — | — | **ABANDONED** (backtest scored _archive EMA chain not smc_bot/) |
 | 4 | 2026-06-15 | SMC Sniper via smc_bot/ chain: 1H swing bias (HH+HL) + 1H OB/FVG POI → 5M sweep (swing pierce+close) + CHoCH. Single exit: 2R TP / SL=wick−0.1%. Config: smc_bot/config.yaml. Backtest: scripts/backtest.py (seam fixed, no _archive). | 1H+5M | 301 | 0.9366 | 0.2498 | 0.6567 | 31.9% | **FAIL** (gross PF < 1.0 — no edge before fees; signal family dead on 5M) |
-| 5 | PRE-REGISTERED | SMC Sniper H1 variant: same smc_bot/ chain (HH+HL bias + OB/FVG POI + sweep + CHoCH) but HTF=4H, LTF=1H. Hypothesis: wider ATR on 1H (~0.9% vs 0.3%) drops fee ratio from ~0.31R to ~0.09R/trade — same structural signal, fee floor evaporates. Single 2R exit. Run on same 2yr holdout data once Trial 4 verdict is logged. | 4H+1H | PRE-REG | — | — | — | — | **PRE-REGISTERED** |
+| 5 | 2026-06-15 | SMC Sniper H1 variant: same smc_bot/ chain (HH+HL bias + OB/FVG POI + sweep + CHoCH), HTF=4H, LTF=1H. Single 2R exit. Same 2yr holdout. | 4H+1H | 26 | 2.3333 | 0.0792 | 2.0833 | 53.8% | **OVERFILTERED** (n<50 — only 26 non-overlapping trades from 155 signals; fee hypothesis CONFIRMED: 0.08R vs predicted 0.09R; extend to 4yr or restructure sampling to pass gate) |
 
 ---
 
