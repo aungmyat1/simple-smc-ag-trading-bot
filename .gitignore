@@ -8,3 +8,7 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
+# Runtime state and data — never commit
+smc_bot_state.json
+smc_bot_trades.csv
+smc_bot_signals.csv

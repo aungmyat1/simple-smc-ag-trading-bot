@@ -10,7 +10,7 @@ bybit:
                 # Keys: BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET from .env
 
 risk:
-  risk_pct: 0.01          # 1% of balance per trade
+  risk_pct: 0.005         # 0.5% of balance per trade (§5 non-bypassable; 0.25% in Phase 2)
   target_r: 2.0           # 2R fixed TP
   sl_buffer: 0.001        # 0.1% pad below/above sweep wick for SL
   max_daily_loss: 0.02    # 2% — halt trading for the rest of the day
