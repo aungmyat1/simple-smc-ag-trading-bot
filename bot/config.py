@@ -20,17 +20,25 @@ RISK_PER_TRADE = 0.005   # 0.5% of account per trade
 MAX_DAILY_LOSS = 0.02    # 2% — halt for the day
 MAX_DRAWDOWN   = 0.10    # 10% from peak — kill switch
 
-# ── Strategy params (LOCKED — change = new trial, log in docs/VERDICT_LOG.md) ─
-EMA_FAST            = 50
-EMA_SLOW            = 200
-SWING_LOOKBACK      = 20
+# ── Strategy params — Trial 3: SMC (OB + Sweep + CHoCH) ──────────────────────
+# LOCKED — every parameter change = new trial, log in docs/VERDICT_LOG.md
+HTF_EMA             = 200    # trend filter: price must be above this EMA
 ATR_PERIOD          = 14
-ATR_STOP_MULT       = 1.5
-TARGET_R            = 2.5
-USE_RETEST          = True
-RETEST_ATR          = 0.5
-BREAKOUT_VALID_BARS = 10
-STARTUP_CANDLE      = 260
+SWING_LOOKBACK      = 20     # bars to define a swing high/low
+TARGET_R            = 3.0    # take-profit in R multiples
+STARTUP_CANDLE      = 250    # warm-up bars before signals fire
+
+# Order Block (OB) params
+OB_DISPLACEMENT_MULT = 1.5   # displacement candle range >= this × ATR
+OB_MAX_AGE_BARS      = 100   # retire OB after N bars (keep it tractable)
+OB_MAX_TOUCHES       = 2     # retire OB after N price touches
+
+# Liquidity sweep params
+SWEEP_MIN_PIERCE = 0.0005    # low must breach ref level by at least 0.05%
+SWEEP_LOOKBACK   = 40        # bars to look back for a sweep before entry
+
+# CHoCH params
+CHoCH_LOOKBACK = 30          # bars after sweep to find a structure break
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
