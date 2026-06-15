@@ -215,20 +215,22 @@ def main() -> None:
     _setup_logging(cfg["logging"]["file"], cfg["logging"]["level"])
     log = logging.getLogger(__name__)
 
-    api_key    = os.getenv("BYBIT_API_KEY", "")
-    api_secret = os.getenv("BYBIT_API_SECRET", "")
-    testnet    = cfg["bybit"]["testnet"]
+    # Use Demo Trading keys (separate from live keys)
+    api_key    = os.getenv("BYBIT_DEMO_API_KEY", os.getenv("BYBIT_API_KEY", ""))
+    api_secret = os.getenv("BYBIT_DEMO_API_SECRET", os.getenv("BYBIT_API_SECRET", ""))
+    demo       = cfg["bybit"]["demo"]
     live       = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
-    client  = data.make_client(testnet=testnet)
-    session = executor.make_session(api_key, api_secret, testnet=testnet)
+    # Demo Trading uses mainnet endpoints (not testnet), so sandbox=False for ccxt
+    client  = data.make_client(testnet=False)
+    session = executor.make_session(api_key, api_secret, demo=demo)
 
     log.info(
-        "SMC Bot started — %s %s/%s testnet=%s live=%s",
+        "SMC Bot started — %s %s/%s demo=%s live=%s",
         cfg["exchange"]["symbol"],
         cfg["exchange"]["htf"],
         cfg["exchange"]["ltf"],
-        testnet,
+        demo,
         live,
     )
 

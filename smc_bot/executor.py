@@ -1,6 +1,6 @@
 """
 Bybit order execution via pybit SDK (HMAC-SHA256 auth).
-Targets Bybit testnet (demo/paper trading).
+Targets Bybit Demo Trading account (api.bybit.com, demo=True).
 
 LIVE_TRADING guard: when LIVE_TRADING env var is 'false' (default),
 place_order() logs the intent but does NOT send to the exchange.
@@ -18,10 +18,15 @@ def _live() -> bool:
     return os.getenv("LIVE_TRADING", "false").lower() == "true"
 
 
-def make_session(api_key: str, api_secret: str, testnet: bool = True) -> HTTP:
-    """Create an authenticated pybit session."""
+def make_session(api_key: str, api_secret: str, demo: bool = True) -> HTTP:
+    """
+    Create an authenticated pybit session.
+    demo=True → Bybit Demo Trading (api.bybit.com with demo account).
+    demo=False → live (use with caution; LIVE_TRADING must also be true).
+    """
     return HTTP(
-        testnet=testnet,
+        testnet=False,
+        demo=demo,
         api_key=api_key,
         api_secret=api_secret,
     )
@@ -33,7 +38,9 @@ def get_balance(session: HTTP, coin: str = "USDT") -> float:
         resp = session.get_wallet_balance(accountType="UNIFIED", coin=coin)
         for c in resp["result"]["list"][0]["coin"]:
             if c["coin"] == coin:
-                return float(c["availableToWithdraw"])
+                # availableToWithdraw is empty in demo accounts; fall back to walletBalance
+                val = c.get("availableToWithdraw") or c.get("walletBalance", "0")
+                return float(val) if val else 0.0
         return 0.0
     except Exception as exc:
         log.error("get_balance failed: %s", exc)
