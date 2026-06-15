@@ -1,0 +1,37 @@
+exchange:
+  symbol: BTCUSDT
+  htf: 1h       # 1H bias + POI
+  ltf: 5m       # 5M execution
+  # API keys come from .env (BYBIT_API_KEY / BYBIT_API_SECRET)
+  # LIVE_TRADING must be False; only the owner flips it manually
+
+bybit:
+  testnet: true   # demo / paper — connects to testnet.bybit.com
+
+risk:
+  risk_pct: 0.01    # 1% of balance per trade
+  target_r: 2.0     # 2R fixed TP
+  sl_buffer: 0.001  # 0.1% pad below/above sweep wick for SL
+
+structure:
+  swing_n: 5        # bars each side to confirm a swing high/low (1H)
+
+poi:
+  ob_lookback: 50   # max 1H bars to scan backwards for OBs
+  fvg_lookback: 30  # max 1H bars to scan backwards for FVGs
+  displacement_atr: 1.5   # OB displacement must be >= N × ATR(14)
+
+liquidity:
+  swing_n: 3        # bars each side for 5M swing detection
+  lookback: 30      # how many 5M bars to scan for prior swing levels
+
+confirmation:
+  lookback: 10      # bars before sweep to establish the CHoCH reference level
+
+data:
+  htf_limit: 150    # 1H candles to fetch
+  ltf_limit: 100    # 5M candles to fetch
+
+logging:
+  file: logs/smc_bot.log
+  level: INFO
