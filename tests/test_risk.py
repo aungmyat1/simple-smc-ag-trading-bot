@@ -42,3 +42,21 @@ def test_trading_allowed_blocked_on_drawdown():
     ok, reason = trading_allowed(8_900, 10_000, 8_900)
     assert not ok
     assert "DRAWDOWN" in reason.upper()
+
+
+def test_consecutive_losses_not_breached():
+    from bot.risk import consecutive_losses_breached
+    assert not consecutive_losses_breached(0)
+    assert not consecutive_losses_breached(1)
+
+
+def test_consecutive_losses_breached():
+    from bot.risk import consecutive_losses_breached
+    assert consecutive_losses_breached(2)
+    assert consecutive_losses_breached(3)
+
+
+def test_trading_allowed_blocked_on_consecutive_losses():
+    ok, reason = trading_allowed(10_000, 10_000, 10_000, consecutive_losses=2)
+    assert not ok
+    assert "CONSECUTIVE" in reason.upper()

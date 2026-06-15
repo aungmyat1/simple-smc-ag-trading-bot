@@ -273,27 +273,73 @@ def _has_choch(high: np.ndarray, close: np.ndarray, sweep_idx: int, n: int) -> b
     return close[n - 1] > post_sweep_max
 
 
+def _in_session(df_5m: pd.DataFrame) -> bool:
+    """
+    True if the last bar falls within London (07–12 UTC) or NY (13–21 UTC).
+    Returns True when SESSION_FILTER_ON is False (disabled in backtest tweaks).
+    """
+    if not config.SESSION_FILTER_ON:
+        return True
+    h = df_5m["ts"].iloc[-1].hour
+    in_london = config.LONDON_SESSION_START <= h < config.LONDON_SESSION_END
+    in_ny     = config.NY_SESSION_START     <= h < config.NY_SESSION_END
+    return in_london or in_ny
+
+
+def _has_displacement(
+    high: np.ndarray,
+    low: np.ndarray,
+    atr_vals: np.ndarray,
+    sweep_idx: int,
+    n: int,
+) -> bool:
+    """
+    After the sweep bar, look for a displacement candle in the next 6 bars:
+    range >= HTF_OB_DISPLACEMENT × ATR  (Sniper Method: 1.5× ATR minimum).
+    """
+    for k in range(sweep_idx + 1, min(sweep_idx + 7, n)):
+        if not np.isnan(atr_vals[k]) and (high[k] - low[k]) >= config.HTF_OB_DISPLACEMENT * atr_vals[k]:
+            return True
+    return False
+
+
 def get_ltf_signal(df_5m: pd.DataFrame, htf_context: dict) -> dict:
     """
     Check LTF entry conditions given HTF context.
     Returns dict with 'action', 'sl', 'tp1', 'tp2', 'tp_runner'.
+
+    Sniper Entry Method sequence (all conditions AND-gated):
+      1. Session filter (London / NY)
+      2. HTF bias bullish
+      3. Price inside 1H POI (OB or FVG)
+      4. Price in discount (below 1H 50% Fib)
+      5. 5M liquidity sweep / inducement (wick below swing low, close above)
+      6. Displacement after sweep (≥1.5×ATR candle — confirms institutional move)
+      7. 5M CHoCH / MSS (break of prior swing high)
+      8. Retrace into fresh 5M OB or FVG (execution zone)
+      9. Minimum R:R ≥ MIN_RR to the runner target
     """
     _flat = {"action": "FLAT", "sl": None, "tp1": None, "tp2": None, "tp_runner": None}
 
     if len(df_5m) < config.LTF_BARS // 2:
         return _flat
 
-    # 1. HTF bias
+    # 1. Session filter
+    if not _in_session(df_5m):
+        return _flat
+
+    # 2. HTF bias
     if htf_context.get("bias") != "bullish":
         return _flat
 
-    high  = df_5m["high"].values
-    low   = df_5m["low"].values
-    close = df_5m["close"].values
-    n     = len(df_5m)
-    price = close[n - 1]
+    high     = df_5m["high"].values
+    low      = df_5m["low"].values
+    close    = df_5m["close"].values
+    atr_vals = _atr(df_5m).values
+    n        = len(df_5m)
+    price    = close[n - 1]
 
-    # 2. Price inside a 1H bullish POI zone
+    # 3. Price inside a 1H bullish POI zone
     in_poi = any(
         low[n - 1] <= z_high and high[n - 1] >= z_low
         for z_low, z_high, _ in htf_context.get("poi_zones", [])
@@ -301,23 +347,27 @@ def get_ltf_signal(df_5m: pd.DataFrame, htf_context: dict) -> dict:
     if not in_poi:
         return _flat
 
-    # 3. Price in discount (below 1H 50% Fib)
+    # 4. Price in discount (below 1H 50% Fib)
     fib50 = htf_context.get("fib50", 0.0)
     if fib50 > 0 and price > fib50:
         return _flat
 
-    # 4. Liquidity sweep of recent 5M swing low
+    # 5. Liquidity sweep / inducement of recent 5M swing low
     sweep_idx, sweep_low = _find_sweep(low, close, n)
     if sweep_idx is None:
         return _flat
 
-    # 5. 5M CHoCH / MSS after the sweep
+    # 6. Displacement after sweep — confirms institutional participation
+    if not _has_displacement(high, low, atr_vals, sweep_idx, n):
+        return _flat
+
+    # 7. 5M CHoCH / MSS after the sweep
     if not _has_choch(high, close, sweep_idx, n):
         return _flat
 
-    # 6. Price retracing into a fresh 5M OB or FVG (execution zone)
-    ob_zones  = _ltf_ob_zones(df_5m)
-    fvg_zones = _ltf_fvg_zones(df_5m)
+    # 8. Price retracing into a fresh 5M OB or FVG (execution zone)
+    ob_zones    = _ltf_ob_zones(df_5m)
+    fvg_zones   = _ltf_fvg_zones(df_5m)
     entry_zones = ob_zones + fvg_zones
     in_entry_zone = any(
         low[n - 1] <= z_high and high[n - 1] >= z_low
@@ -326,8 +376,8 @@ def get_ltf_signal(df_5m: pd.DataFrame, htf_context: dict) -> dict:
     if not in_entry_zone:
         return _flat
 
-    # All conditions met — build trade plan
-    sl   = sweep_low * (1.0 - 0.001)   # 0.1% below wick
+    # Build trade plan
+    sl   = sweep_low * (1.0 - 0.001)   # 0.1% buffer below sweep wick
     risk = price - sl
     if risk <= 0:
         return _flat
@@ -335,9 +385,13 @@ def get_ltf_signal(df_5m: pd.DataFrame, htf_context: dict) -> dict:
     tp1 = price + risk * config.TP1_R
     tp2 = price + risk * config.TP2_R
 
-    # Runner TP = nearest 1H liquidity high above entry
+    # Runner TP = nearest 1H buy-side liquidity pool above entry
     liq_highs = [h for h in htf_context.get("liquidity_highs", []) if h > price]
     tp_runner  = min(liq_highs) if liq_highs else price + risk * config.TARGET_R
+
+    # 9. Minimum R:R gate
+    if tp_runner < price + risk * config.MIN_RR:
+        return _flat
 
     return {
         "action":    "LONG",

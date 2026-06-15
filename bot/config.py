@@ -43,12 +43,23 @@ LTF_SWEEP_LOOKBACK = 20     # 5M bars to scan for a liquidity sweep
 LTF_SWEEP_PIERCE   = 0.0003 # low must breach ref level by ≥ 0.03%
 LTF_OB_MAX_AGE     = 30     # 5M bars before entry OB/FVG expires
 
-# Partial TP management
-TP1_R    = 1.0   # close TP1_FRAC of position at 1R
+# Partial TP management — Sniper Method: minimum 1:2, ideal 1:3 to 1:10
+TP1_R    = 2.0   # close TP1_FRAC of position at 2R (first R:R milestone)
 TP1_FRAC = 0.50  # 50% off at TP1, then move SL to breakeven
-TP2_R    = 2.0   # close TP2_FRAC of position at 2R
+TP2_R    = 3.0   # close TP2_FRAC of position at 3R
 TP2_FRAC = 0.25  # 25% off at TP2; remaining 25% runs to HTF liquidity target
-TARGET_R = 3.0   # fallback runner target if no HTF liquidity found above entry
+TARGET_R = 4.0   # fallback runner target if no HTF liquidity found above entry
+MIN_RR   = 2.0   # minimum R:R gate — reject signal if TP runner < 2R
+
+# Session filter — London / New York only (UTC hours)
+SESSION_FILTER_ON    = True
+LONDON_SESSION_START = 7    # 07:00 UTC
+LONDON_SESSION_END   = 12   # 12:00 UTC
+NY_SESSION_START     = 13   # 13:00 UTC
+NY_SESSION_END       = 21   # 21:00 UTC
+
+# Consecutive loss guard — stop after N losses in a row (resets on a win)
+MAX_CONSECUTIVE_LOSSES = 2
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")

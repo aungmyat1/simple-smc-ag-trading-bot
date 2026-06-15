@@ -57,13 +57,14 @@ class BotState:
     tp_runner:     float = 0.0
     original_qty:  float = 0.0
     remaining_qty: float = 0.0
-    tp1_hit:       bool  = False
-    tp2_hit:       bool  = False
-    sl_at_be:      bool  = False
-    peak_equity:   float = 0.0
-    day_start_eq:  float = 0.0
-    day_start_date: str  = ""
-    paper_equity:  float = 1000.0
+    tp1_hit:            bool  = False
+    tp2_hit:            bool  = False
+    sl_at_be:           bool  = False
+    peak_equity:        float = 0.0
+    day_start_eq:       float = 0.0
+    day_start_date:     str   = ""
+    paper_equity:       float = 1000.0
+    consecutive_losses: int   = 0
 
     def update_day_start(self, equity: float) -> None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -129,7 +130,8 @@ def _manage_position(state: BotState, latest_high: float, latest_low: float) -> 
             exit_reason="TP_RUNNER",
         )
         alerts.send(f"[BOT] TP_RUNNER hit | exit={state.tp_runner:.2f}")
-        state.in_position = False
+        state.in_position       = False
+        state.consecutive_losses = 0
         return
 
     # SL hit
@@ -145,9 +147,12 @@ def _manage_position(state: BotState, latest_high: float, latest_low: float) -> 
             sl=state.sl, tp=state.tp_runner, qty=state.remaining_qty,
             exit_reason=reason,
         )
-        pnl_r = (state.sl - state.entry_price) / (state.entry_price - (state.sl if state.sl_at_be else state.sl))
         alerts.send(f"[BOT] {reason} | exit={state.sl:.2f}")
         state.in_position = False
+        if not state.sl_at_be:   # real loss (BE exits are neutral — don't count)
+            state.consecutive_losses += 1
+        else:
+            state.consecutive_losses = 0
 
 
 def run_cycle(state: BotState) -> None:
@@ -155,7 +160,8 @@ def run_cycle(state: BotState) -> None:
     state.update_peak(equity)
     state.update_day_start(equity)
 
-    ok, reason = risk.trading_allowed(equity, state.peak_equity, state.day_start_eq)
+    ok, reason = risk.trading_allowed(equity, state.peak_equity, state.day_start_eq,
+                                       state.consecutive_losses)
     if not ok:
         msg = f"[BOT] HALT — {reason}"
         log.warning(msg)

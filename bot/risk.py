@@ -39,7 +39,13 @@ def drawdown_breached(equity: float, peak_equity: float) -> bool:
     return (equity - peak_equity) / peak_equity < -config.MAX_DRAWDOWN
 
 
-def trading_allowed(equity: float, peak: float, day_start: float) -> tuple[bool, str]:
+def consecutive_losses_breached(count: int) -> bool:
+    """True if consecutive losses >= MAX_CONSECUTIVE_LOSSES (resets on any win)."""
+    return count >= config.MAX_CONSECUTIVE_LOSSES
+
+
+def trading_allowed(equity: float, peak: float, day_start: float,
+                    consecutive_losses: int = 0) -> tuple[bool, str]:
     """
     Combined guard. Returns (ok, reason_string).
     ok=False → halt trading immediately.
@@ -48,4 +54,6 @@ def trading_allowed(equity: float, peak: float, day_start: float) -> tuple[bool,
         return False, f"MAX_DRAWDOWN breached: peak={peak:.2f} equity={equity:.2f}"
     if daily_loss_breached(equity, day_start):
         return False, f"DAILY_LOSS breached: day_start={day_start:.2f} equity={equity:.2f}"
+    if consecutive_losses_breached(consecutive_losses):
+        return False, f"CONSECUTIVE_LOSSES breached: {consecutive_losses} in a row"
     return True, "ok"

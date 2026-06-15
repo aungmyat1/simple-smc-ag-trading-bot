@@ -12,7 +12,7 @@ Fee model: Bybit taker 0.06%/side = 0.12% round trip.
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | 2026-06-15 | EMA50/200 trend + 20-bar swing break + retest (tol 0.5×ATR, valid 10 bars) | 15m | 1570 | 1.0233 | 0.313 | 0.6834 | 29.0% | **FAIL** |
 | 2 | 2026-06-15 | EMA50/200 trend + 20-bar swing breakout-only (no retest) | 15m | 1333 | 0.9932 | 0.348 | 0.6399 | 28.4% | **FAIL** |
-| 3 | 2026-06-15 | SMC: 1H POI (OB+FVG) → 5M sweep + MSS/CHoCH → retrace into 5M OB/FVG. Partial TPs: 50%@1R / 25%@2R / 25%@HTF-liquidity. SL below sweep wick. | 1H+5M | TBD | — | — | — | — | **PENDING** |
+| 3 | 2026-06-15 | SMC Sniper (1BullBear Ep15A): London/NY session filter + 1H POI (OB/FVG, discount) → 5M inducement sweep + displacement (≥1.5×ATR) + CHoCH + 5M OB/FVG retrace. Partials: 50%@2R (→BE) / 25%@3R / 25%@HTF-liq. Min R:R=2. Consec-loss guard=2. | 1H+5M | TBD | — | — | — | — | **PENDING** |
 
 ---
 

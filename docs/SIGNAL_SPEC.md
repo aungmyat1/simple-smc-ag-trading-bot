@@ -1,95 +1,106 @@
 # Signal Specification — Trial 3
 
-**Strategy ID:** `A1_SMC_1H5M_CONFIRMATION`
+**Strategy ID:** `A1_SMC_1H5M_CONFIRMATION` (Sniper Entry Method)
+**Source:** 1BullBear Episode 15A — Smart Money Concepts Sniper Entry
 **Status:** PENDING Phase-0 gate
 **Locked:** 2026-06-15 — do not change parameters; any change = new trial
 
 ---
 
-## Core Thesis
+## Core Philosophy
 
-Trade only when five sequential conditions align:
-
-```
-1H POI (location)
-    +
-5M Liquidity Sweep (trap)
-    +
-5M MSS / CHoCH (confirmation)
-    +
-5M OB/FVG Retest (execution zone)
-    =
-Trade Entry
-```
-
-Hypothesis: the 1H context filter increases trade quality enough to overcome
-the 5M fee floor, versus scanning 15m blindly (Trials 1 & 2 — net PF 0.64–0.68).
+> "Do not predict — react. Wait for smart money to reveal its hand through a
+> liquidity sweep, a structure shift, and a precise retest. Then enter with a
+> tight stop, structured targets, and disciplined risk management."
 
 ---
 
-## WHERE Layer — 1H (HTF)
+## Timeframe Hierarchy
 
-**Bias (must be bullish to take longs):**
-- `close[1H] > EMA200` on the 1H chart
-- EMA200 slope positive over the last 5 bars
+| Role | TF | Purpose |
+|------|----|---------|
+| Bias | 1H (HTF) | EMA200 trend direction + POI zones + discount/premium |
+| Execution | 5M (LTF) | Liquidity sweep / inducement + CHoCH + displacement |
+| Entry zone | 5M OB / FVG | Exact limit entry after retrace |
 
-**POI Zones — bullish entry zones:**
-1. **Order Block (OB):** last bearish 1H candle immediately before a
-   displacement bar (range ≥ 1.5 × ATR14) that closes above the prior
-   20-bar swing high. Zone = OB body (open–close), active for ≤ 50 bars.
-2. **Fair Value Gap (FVG):** bullish — `low[i] > high[i-2]`. Zone = the gap.
-   Active for ≤ 50 bars.
-
-**Discount filter:**
-- Fibonacci midpoint of last 100-bar swing range = equilibrium (50% level)
-- Long entries only when current 5M price ≤ fib50 (below midpoint = discount)
-
-**Liquidity targets (TP runner):**
-- Equal highs on 1H (within 0.1% tolerance, ≥ 2 instances) = buy-side pool
+Bot runs longs only (bearish side added if Trial 3 passes Phase-0 and Phase-1).
 
 ---
 
-## WHEN Layer — 5M (LTF), sequential stages
+## Entry Sequence (ALL conditions AND-gated — one missing = NO TRADE)
 
-### Stage 1 — Liquidity Sweep
+### Pre-filter
+- [ ] **Session filter**: London (07–12 UTC) or New York (13–21 UTC) only.
+      Asian session excluded — low volume, choppy structure.
 
-In the last 20 5M bars:
-- A bar's low pierces the prior 10-bar swing low by ≥ 0.03%
-- That same bar closes **above** the pierced level (trap + recovery)
+### Stage 1 — HTF Bias (1H)
+- [ ] `close[1H] > EMA200` AND EMA200 slope positive over last 5 bars → bullish
+- [ ] 1H bullish POI zone exists: **Order Block** or **FVG**
+      - OB: last bearish 1H candle before a 1.5×ATR displacement that closes above prior swing high
+      - FVG: `high[i-2] < low[i]` (gap between bar i-2 high and bar i low)
+      - Zone active for ≤ 50 1H bars
+- [ ] Current 5M price ≤ 1H Fibonacci 50% (in **discount** zone)
 
-### Stage 2 — Displacement (implied by OB formation)
+### Stage 2 — Inducement / Liquidity Sweep (5M)
+- [ ] In last 20 5M bars: a bar's low pierced the prior 10-bar swing low by ≥ 0.03%
+      AND that bar **closed above** the pierced level
+- This is the inducement — **do not enter until the sweep is visible**
+- SL will sit 0.1% below the sweep wick extreme
 
-The bar immediately after the sweep must have:
-- Range ≥ 1.5 × ATR14 on 5M
-- Closes above the recent 10-bar 5M swing high
+### Stage 3 — Displacement (5M, post-sweep)
+- [ ] In the 6 bars after the sweep: at least one bar has range ≥ 1.5 × ATR14
+- Confirms institutional participation — absence = no valid setup
 
-This bar's preceding bearish candle defines the **5M OB zone**.
+### Stage 4 — CHoCH / MSS (5M)
+- [ ] After the sweep bar, `close > max(high[sweep_bar:current])` — prior swing high broken
+- This is the Change of Character confirming the structural trend flip
 
-### Stage 3 — MSS / CHoCH
+### Stage 5 — Execution Zone (5M OB or FVG)
+- [ ] Current 5M bar overlaps a fresh 5M bullish OB or FVG formed by the displacement
+      (active ≤ 30 5M bars)
+- Enter on retrace into this zone — not on the CHoCH close itself
 
-After the sweep bar:
-- `close > max(high[sweep_bar : current])` — a prior swing high is broken
-- This is the Change of Character (CHoCH) confirming trend flip
-
-### Stage 4 — Retest into Execution Zone
-
-Current 5M bar must overlap a **fresh 5M bullish OB or FVG**
-(formed by the displacement, active ≤ 30 bars).
-
-All four stages required simultaneously. Default = NO_TRADE.
+### Stage 6 — Minimum R:R Gate
+- [ ] Runner target ≥ 2R from entry above the stop loss
+- If no HTF liquidity pool satisfies this, trade is rejected
 
 ---
 
 ## Execution
 
-| | Value |
-|---|---|
-| **Entry** | Close of signal bar (live: open of next bar) |
-| **SL** | 0.1% below sweep wick low (structural) |
-| **TP1 (50%)** | entry + 1R — move SL to breakeven |
-| **TP2 (25%)** | entry + 2R |
-| **Runner (25%)** | nearest 1H equal highs above entry, or entry + 3R |
-| **Risk/trade** | 0.5% of account (config.RISK_PER_TRADE) |
+| | Value | Source |
+|---|---|---|
+| **Entry** | Close of signal bar (live: open of next 5M bar) | Stage 5 retest |
+| **SL** | 0.1% below sweep wick low | Inducement extreme |
+| **TP1 (50%)** | entry + 2R → move SL to breakeven | Partial lock-in |
+| **TP2 (25%)** | entry + 3R | Internal liquidity |
+| **Runner (25%)** | Nearest 1H equal highs above entry, or entry + 4R | External liquidity |
+| **Risk/trade** | 0.5% of account (config.RISK_PER_TRADE) | Non-bypassable |
+| **Minimum R:R** | 1:2 to runner | Reject signal if < 2R |
+
+---
+
+## Risk Guards
+
+| Guard | Threshold | Action |
+|---|---|---|
+| Daily loss | 2% of day-start equity | Halt for the day |
+| Max drawdown | 10% from peak | Kill switch |
+| Consecutive losses | 2 in a row | Halt until winning trade resets |
+
+Consecutive loss guard resets to 0 on any winning exit (TP1/TP2/runner).
+Breakeven exits (SL-BE) do not count as a loss.
+
+---
+
+## Common Mistakes This Spec Guards Against
+
+1. **Entering before the sweep** → Stage 2 required
+2. **No displacement** → Stage 3 required (confirms institutions, not retail noise)
+3. **Trading mid-range** → Stage 1 discount filter prevents buying at 50%+ Fib
+4. **Asian session chop** → Stage 0 session filter
+5. **Stop too tight at inducement level** → SL is 0.1% BELOW the wick, not AT it
+6. **Bad R:R** → Stage 6 minimum 1:2 gate
 
 ---
 
@@ -97,18 +108,17 @@ All four stages required simultaneously. Default = NO_TRADE.
 
 | ID | Question |
 |---|---|
-| RQ-1 | Does Sweep + MSS + Retest outperform the single-TF OB+CHoCH (Trial 3 single-TF)? |
-| RQ-2 | Which execution zone is best? OB-only vs FVG-only vs OB+FVG vs 50% Fib |
-| RQ-3 | Which HTF filter is best? OB-only vs FVG-only vs OB+FVG vs discount-only |
-| RQ-4 | Does 5M execution survive fees better than 15m? (fee/stop ratio on 5M structural SL) |
+| RQ-1 | Does Sweep + Displacement + MSS + Retest outperform prior SMC attempts (A5: FRAGILE)? |
+| RQ-2 | Does the session filter help or hurt trade count (n≥50 gate risk)? |
+| RQ-3 | OB-only vs FVG-only vs combined — which execution zone has higher net PF? |
+| RQ-4 | 2R/3R/4R TP ratios vs original 1R/2R/3R — impact on net PF with 3-tier partials |
 
 ---
 
 ## What This Is NOT
 
-- Not a replacement for the existing Phase-0 gate process
-- Not proof of edge — backtest result determines verdict
-- NOT enabled for live trading until Phase-1 (30 days paper) also passes
+- Not a prediction system — reaction only
+- Not proven — Phase-0 gate determines verdict
+- NOT live until Phase-0 AND Phase-1 (30 days paper) both pass
 
-**Next step:** Run `python scripts/backtest.py` after fetching 5M and 1H data.
-Log result in `VERDICT_LOG.md` row 3 — whether PASS or FAIL.
+**Next step:** Fetch data, run `python scripts/backtest.py`, log result in VERDICT_LOG.md row 3.
