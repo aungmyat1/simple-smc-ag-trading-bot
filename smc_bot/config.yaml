@@ -10,7 +10,8 @@ bybit:
                 # Keys: BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET from .env
 
 risk:
-  risk_pct: 0.005         # 0.5% of balance per trade (§5 non-bypassable; 0.25% in Phase 2)
+  risk_usd: 200           # fixed dollar risk per trade (qty = risk_usd / stop_distance)
+  risk_pct: 0.005         # fallback only — used if risk_usd absent; not active when risk_usd is set
   target_r: 2.0           # 2R fixed exit (4H+1H baseline)
   sl_buffer: 0.001        # 0.1% pad below/above sweep wick for SL
   max_daily_loss: 0.02    # 2% — halt trading for the rest of the day

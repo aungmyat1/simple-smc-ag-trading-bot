@@ -188,6 +188,100 @@ def get_last_closed_pnl(
         return None
 
 
+def place_reduce_only_limit(
+    session: HTTP,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+) -> dict:
+    """
+    Place a reduce-only GTC limit order for partial close (TP1).
+
+    side: 'Sell' to close a long, 'Buy' to close a short.
+    Bybit auto-cancels reduce-only orders when the position reaches zero,
+    so no manual cancellation is needed if SL fires first.
+
+    In PAPER mode returns a synthetic result without touching the exchange.
+    """
+    log.info(
+        "REDUCE-ONLY LIMIT %s %s qty=%s price=%.2f [mode=%s]",
+        side, symbol, qty, price,
+        "LIVE" if _live() else "PAPER",
+    )
+
+    if not _live():
+        return {
+            "orderId": f"PAPER-ROL-{side[:1]}-{round(price,0):.0f}",
+            "side": side, "qty": str(qty), "price": price, "reduceOnly": True,
+        }
+
+    resp = session.place_order(
+        category="linear",
+        symbol=symbol,
+        side=side,
+        orderType="Limit",
+        qty=str(qty),
+        price=str(round(price, 2)),
+        reduceOnly=True,
+        timeInForce="GTC",
+        positionIdx=0,
+    )
+
+    _assert_ok(resp, "place_reduce_only_limit")
+
+    order_id = resp.get("result", {}).get("orderId", "")
+    if not order_id:
+        raise RuntimeError(
+            f"place_reduce_only_limit: retCode=0 but no orderId: {resp}"
+        )
+
+    log.info("TP1 limit confirmed: orderId=%s price=%.2f qty=%s", order_id, price, qty)
+    return resp["result"]
+
+
+def set_trading_stop(
+    session: HTTP,
+    symbol: str,
+    sl: float | None = None,
+    tp: float | None = None,
+) -> dict:
+    """
+    Amend the position-level SL and/or TP in-flight (breakeven move after TP1).
+
+    Bybit's set_trading_stop modifies the active position stop — it does NOT
+    create a new order.  Pass sl=entry_price to move the stop to breakeven.
+    Pass sl=0 or tp=0 to clear that level.
+
+    In PAPER mode logs the intent and returns a synthetic result.
+    """
+    log.info(
+        "SET_TRADING_STOP %s sl=%s tp=%s [mode=%s]",
+        symbol, sl, tp,
+        "LIVE" if _live() else "PAPER",
+    )
+
+    if not _live():
+        return {"symbol": symbol, "sl": sl, "tp": tp, "paper": True}
+
+    kwargs: dict = {
+        "category": "linear",
+        "symbol": symbol,
+        "positionIdx": 0,
+    }
+    if sl is not None:
+        kwargs["stopLoss"]    = str(round(sl, 2))
+        kwargs["slTriggerBy"] = "LastPrice"
+    if tp is not None:
+        kwargs["takeProfit"]  = str(round(tp, 2))
+        kwargs["tpTriggerBy"] = "LastPrice"
+
+    resp = session.set_trading_stop(**kwargs)
+    _assert_ok(resp, "set_trading_stop")
+    log.info("Trading stop amended: sl=%s tp=%s", sl, tp)
+    return resp.get("result", {})
+
+
 def close_position(session: HTTP, symbol: str) -> dict:
     """Close the open position at market (reduce-only)."""
     pos = get_position(session, symbol)

@@ -79,6 +79,10 @@ class BotState:
     was_in_position:    bool  = False  # tracks position transitions for loss detection
     open_order_id:      str   = ""     # orderId of the most recently placed order
     entry_time:         str   = ""     # ISO UTC timestamp of the most recent entry
+    # Partial-exit / breakeven tracking
+    entry_price:        float = 0.0   # price at which the position was entered
+    entry_qty:          float = 0.0   # full position size at entry (BTC)
+    tp1_filled:         bool  = False  # True once TP1 reduce-only limit has filled
 
     def save(self) -> None:
         _STATE_FILE.write_text(json.dumps(asdict(self), indent=2))
@@ -278,6 +282,9 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
             )
         state.open_order_id = ""
         state.entry_time    = ""
+        state.entry_price   = 0.0
+        state.entry_qty     = 0.0
+        state.tp1_filled    = False
         state.save()
 
     state.was_in_position = in_position
@@ -288,6 +295,28 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
             "Position open: side=%s size=%s avgPrice=%s",
             pos.get("side"), pos.get("size"), pos.get("avgPrice"),
         )
+        # ── TP1 fill detection → move SL to breakeven ─────────────────────────
+        # After the reduce-only TP1 limit fills, position size drops to ~50% of
+        # entry_qty.  Detect this and amend the position-level SL to entry price.
+        if (not state.tp1_filled
+                and state.entry_qty > 0
+                and state.entry_price > 0):
+            pos_size = float(pos.get("size", "0"))
+            if pos_size < state.entry_qty * 0.75:
+                try:
+                    executor.set_trading_stop(session, sym, sl=state.entry_price)
+                    state.tp1_filled = True
+                    state.save()
+                    log.info(
+                        "TP1 detected (size %.3f < %.3f) — SL moved to BE %.2f",
+                        pos_size, state.entry_qty * 0.75, state.entry_price,
+                    )
+                    alerts.send(
+                        f"✅ TP1 hit [{sym}] size={pos_size} — "
+                        f"SL moved to BE {state.entry_price:.0f}"
+                    )
+                except Exception as exc:
+                    log.error("Failed to move SL to BE: %s", exc)
         return
 
     # 4. Fetch candles
@@ -470,9 +499,13 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         achieved_r = abs(tp - price) / stop_dist
         log.info("TP at liquidity pool %.2f (%.2fR)", tp, achieved_r)
 
-    qty = risk.calc_qty(balance, price, sl, rc["risk_pct"])
+    qty = risk.calc_qty(
+        balance, price, sl,
+        risk_pct=rc.get("risk_pct", 0.005),
+        risk_usd=rc.get("risk_usd"),        # fixed $200 when set; overrides risk_pct
+    )
     if qty <= 0:
-        log.warning("qty=0; skipping (stop distance too small?)")
+        log.warning("qty=0; skipping (stop distance too wide for $%.0f risk?)", rc.get("risk_usd", 0))
         return
 
     signal_only = cfg.get("signal_only_mode", True)
@@ -556,6 +589,32 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     order_id   = result.get("orderId", "")
     entry_time = datetime.now(timezone.utc).isoformat()
 
+    # ── TP1 reduce-only limit (50% close at 1R) ───────────────────────────────
+    # Placed immediately after entry.  GTC; Bybit auto-cancels it if SL fires
+    # and the position closes to zero before TP1 is reached.
+    tp1_order_id = ""
+    close_side   = "Sell" if side == "Buy" else "Buy"
+    tp1_raw      = qty * tp1_pct
+    tp1_qty      = round(round(tp1_raw / executor.BYBIT_QTY_STEP) * executor.BYBIT_QTY_STEP, 3)
+    if tp1_qty >= executor.BYBIT_MIN_QTY:
+        try:
+            tp1_result   = executor.place_reduce_only_limit(
+                session, sym, close_side, tp1_qty, tp1_price
+            )
+            tp1_order_id = tp1_result.get("orderId", "")
+            log.info(
+                "TP1 reduce-only limit placed: qty=%.3f @ %.2f orderId=%s",
+                tp1_qty, tp1_price, tp1_order_id,
+            )
+        except Exception as exc:
+            log.error("Failed to place TP1 limit — trade still open: %s", exc)
+            alerts.send(f"⚠ TP1 limit failed [{sym}]: {exc}")
+    else:
+        log.warning(
+            "tp1_qty=%.3f below exchange minimum — TP1 limit skipped",
+            tp1_qty,
+        )
+
     _log_trade({
         "timestamp": entry_time,
         "symbol":    sym,
@@ -571,13 +630,17 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
 
     state.open_order_id   = order_id
     state.entry_time      = entry_time
+    state.entry_price     = price
+    state.entry_qty       = qty
+    state.tp1_filled      = False
     state.was_in_position = True
     state.save()
 
-    log.info("Trade logged — orderId=%s", order_id)
+    log.info("Trade logged — orderId=%s tp1_orderId=%s", order_id, tp1_order_id)
     alerts.send(
         f"✅ SMC Bot [{sym}] ORDER {side} | entry={price:.0f} "
-        f"SL={sl:.0f} TP={tp:.0f} qty={qty} orderId={order_id}"
+        f"SL={sl:.0f} TP1={tp1_price:.0f}(50%) TP2={tp:.0f} "
+        f"qty={qty} orderId={order_id}"
     )
 
 

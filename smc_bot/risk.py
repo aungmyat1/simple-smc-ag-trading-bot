@@ -18,44 +18,48 @@ def calc_qty(
     entry: float,
     sl: float,
     risk_pct: float = 0.01,
+    risk_usd: float | None = None,
 ) -> float:
     """
     Return position size in BTC, snapped to BYBIT_QTY_STEP and floored at
     BYBIT_MIN_QTY.  Returns 0.0 if the stop distance is zero/negative.
 
-    Bybit rejects orders below BYBIT_MIN_QTY with retCode=10001, so we snap
-    up to the minimum rather than letting the caller send an invalid order.
-    The resulting risk overshoot is at most BYBIT_MIN_QTY * stop_dist, which
-    is negligible for any reasonable account size.
+    Sizing modes (mutually exclusive; risk_usd takes priority):
+      risk_usd  — fixed dollar risk per trade: qty = risk_usd / stop_dist
+      risk_pct  — percentage of balance:       qty = (balance * risk_pct) / stop_dist
+
+    Bybit rejects orders below BYBIT_MIN_QTY with retCode=10001, so we return
+    0.0 rather than rounding up and silently over-risking.
     """
     stop_dist = abs(entry - sl)
     if stop_dist <= 0:
         log.warning("Stop distance is zero; cannot size position")
         return 0.0
 
-    risk_usdt = balance * risk_pct
-    raw_qty   = risk_usdt / stop_dist
+    if risk_usd is not None:
+        risk_usdt = risk_usd
+    else:
+        risk_usdt = balance * risk_pct
+
+    raw_qty = risk_usdt / stop_dist
 
     # Snap to exchange step size
     steps = round(raw_qty / BYBIT_QTY_STEP)
     qty   = steps * BYBIT_QTY_STEP
 
     if qty < BYBIT_MIN_QTY:
-        # Rounding UP to the minimum would silently breach risk_pct (the actual
-        # dollar risk could be several multiples of the intended amount on a small
-        # account).  Return 0.0 so the caller's qty <= 0 guard skips the trade.
         log.warning(
             "Computed qty %.4f is below exchange minimum %.3f — skipping trade "
-            "(account too small or stop too wide for this risk_pct)",
-            raw_qty, BYBIT_MIN_QTY,
+            "(risk_usd=%.2f stop_dist=%.4f)",
+            raw_qty, BYBIT_MIN_QTY, risk_usdt, stop_dist,
         )
         return 0.0
 
     qty = round(qty, 3)
 
     log.debug(
-        "Position size: balance=%.2f risk_usdt=%.2f stop_dist=%.4f raw=%.4f qty=%.3f",
-        balance, risk_usdt, stop_dist, raw_qty, qty,
+        "Position size: risk_usdt=%.2f stop_dist=%.4f raw=%.4f qty=%.3f",
+        risk_usdt, stop_dist, raw_qty, qty,
     )
     return qty
 
