@@ -109,6 +109,33 @@ def get_sweep(
     return None
 
 
+def displacement_strength(
+    df: pd.DataFrame,
+    sweep_bar: int,
+    bias: str,
+    atr_mult_strong: float = 2.0,
+) -> str:
+    """
+    Return 'Strong' if the best post-sweep displacement candle is ≥ atr_mult_strong × ATR,
+    'Normal' otherwise (caller already confirmed ≥ 1.5 × ATR via check_displacement).
+    """
+    n     = len(df)
+    atr   = _atr14(df)
+    high  = df["high"].values
+    low   = df["low"].values
+    open_ = df["open"].values
+    close = df["close"].values
+
+    best = 0.0
+    for i in range(sweep_bar + 1, n):
+        if bias == "bullish" and close[i] > open_[i]:
+            best = max(best, high[i] - low[i])
+        elif bias == "bearish" and close[i] < open_[i]:
+            best = max(best, high[i] - low[i])
+
+    return "Strong" if (atr > 0 and best / atr >= atr_mult_strong) else "Normal"
+
+
 def check_displacement(
     df: pd.DataFrame,
     sweep_bar: int,

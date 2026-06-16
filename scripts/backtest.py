@@ -178,13 +178,38 @@ def _fast_bias(htf_idx: int) -> str:
     return "neutral"
 
 
-def _fast_pois(htf_idx: int, bias: str) -> list[dict]:
+def _fast_filter_fresh(zones: list[dict], htf_idx: int, bias: str) -> tuple[list[dict], int]:
     """
-    O(OB_LB + FVG_LB) replacement for poi.get_pois(df_1h.iloc[:htf_idx+1], bias, ...).
+    Trial 6 mitigation filter — inline fast version of poi.filter_fresh_zones.
 
-    Uses _ATR14_1H[htf_idx] instead of recomputing EWM over the full growing slice.
-    Logic is identical to smc_bot/poi.py:get_pois — verified line-by-line.
+    A zone is mitigated if any bar between creation_bar+1 and htf_idx (inclusive)
+    has traded through at least the zone midpoint:
+      bullish: low  ≤ midpoint
+      bearish: high ≥ midpoint
+
+    Returns (fresh_zones, rejected_count).
     """
+    fresh, rejected = [], 0
+    for z in zones:
+        mid = (z["low"] + z["high"]) / 2.0
+        cb  = z["creation_bar"]
+        mitigated = False
+        for k in range(cb + 1, htf_idx + 1):
+            if bias == "bullish" and _L_1H[k] <= mid:
+                mitigated = True
+                break
+            if bias == "bearish" and _H_1H[k] >= mid:
+                mitigated = True
+                break
+        if mitigated:
+            rejected += 1
+        else:
+            fresh.append(z)
+    return fresh, rejected
+
+
+def _fast_pois_raw(htf_idx: int, bias: str) -> list[dict]:
+    """Zone detection only — no mitigation filter. Used by count_funnel for stats."""
     if bias == "neutral":
         return []
     n   = htf_idx + 1
@@ -203,12 +228,12 @@ def _fast_pois(htf_idx: int, bias: str) -> list[dict]:
             j1 = j + 1
             if c[j1] > o[j1] and (h[j1] - l[j1]) >= DISP_ATR * atr:
                 zones.append({"kind": "OB", "low": float(min(o[j], c[j])),
-                               "high": float(max(o[j], c[j]))})
+                               "high": float(max(o[j], c[j])), "creation_bar": j})
         start = max(2, n - FVG_LB)
         for i in range(start, n):
             fvg_lo, fvg_hi = float(h[i - 2]), float(l[i])
             if fvg_hi > fvg_lo:
-                zones.append({"kind": "FVG", "low": fvg_lo, "high": fvg_hi})
+                zones.append({"kind": "FVG", "low": fvg_lo, "high": fvg_hi, "creation_bar": i})
 
     elif bias == "bearish":
         start = max(0, n - OB_LB)
@@ -218,13 +243,25 @@ def _fast_pois(htf_idx: int, bias: str) -> list[dict]:
             j1 = j + 1
             if c[j1] < o[j1] and (h[j1] - l[j1]) >= DISP_ATR * atr:
                 zones.append({"kind": "OB", "low": float(min(o[j], c[j])),
-                               "high": float(max(o[j], c[j]))})
+                               "high": float(max(o[j], c[j])), "creation_bar": j})
         start = max(2, n - FVG_LB)
         for i in range(start, n):
             fvg_hi, fvg_lo = float(l[i - 2]), float(h[i])
             if fvg_hi > fvg_lo:
-                zones.append({"kind": "FVG", "low": fvg_lo, "high": fvg_hi})
+                zones.append({"kind": "FVG", "low": fvg_lo, "high": fvg_hi, "creation_bar": i})
 
+    return zones
+
+
+def _fast_pois(htf_idx: int, bias: str) -> list[dict]:
+    """
+    O(OB_LB + FVG_LB) replacement for poi.get_pois(df_1h.iloc[:htf_idx+1], bias, ...).
+
+    Uses _ATR14_1H[htf_idx] instead of recomputing EWM over the full growing slice.
+    Logic is identical to smc_bot/poi.py:get_pois — verified line-by-line.
+    Includes Trial 6 mitigation filter via _fast_filter_fresh.
+    """
+    zones, _ = _fast_filter_fresh(_fast_pois_raw(htf_idx, bias), htf_idx, bias)
     return zones
 
 
@@ -398,7 +435,7 @@ def _scan_exit_short(
 
 # ── Backtest ──────────────────────────────────────────────────────────────────
 
-def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
+def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -> dict:
     htf_map    = _align_htf(df_1h, df_5m)
     open_5m    = _O_5M   # precomputed — same as df_5m["open"].values
     high_5m    = _H_5M
@@ -425,6 +462,10 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
         bias, pois = _htf_cache[htf_idx]
 
         if bias == "neutral":
+            continue
+        if side == "long"  and bias != "bullish":
+            continue
+        if side == "short" and bias != "bearish":
             continue
 
         price = float(_C_5M[i])
@@ -521,26 +562,36 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
             peak = equity
         max_dd = max(max_dd, peak - equity)
 
+    n = len(trades)
+    expectancy = sum(t["net_r"] for t in trades) / n
+
     return {
-        "n":         len(trades),
-        "gross_pf":  round(gross_wins / gross_loss, 4) if gross_loss else float("inf"),
-        "net_pf":    round(net_wins   / net_loss,   4) if net_loss   else float("inf"),
-        "win_rate":  round(wins / len(trades) * 100, 2),
-        "avg_fee_r": round(sum(t["fee_r"] for t in trades) / len(trades), 4),
-        "max_dd_r":  round(max_dd, 4),
-        "trades":    trades,
+        "n":          n,
+        "gross_pf":   round(gross_wins / gross_loss, 4) if gross_loss else float("inf"),
+        "net_pf":     round(net_wins   / net_loss,   4) if net_loss   else float("inf"),
+        "win_rate":   round(wins / n * 100, 2),
+        "avg_fee_r":  round(sum(t["fee_r"] for t in trades) / n, 4),
+        "expectancy": round(expectancy, 4),
+        "max_dd_r":   round(max_dd, 4),
+        "trades":     trades,
     }
 
 
 # ── Phase-C report ────────────────────────────────────────────────────────────
 
-def print_report(stats: dict, run_label: str = "Trial X", htf_label: str = "1H", ltf_label: str = "5M") -> None:
+def print_report(
+    stats: dict,
+    run_label: str = "Trial X",
+    htf_label: str = "1H",
+    ltf_label: str = "5M",
+    side: str = "both",
+) -> None:
     n, gross_pf, net_pf = stats["n"], stats["gross_pf"], stats["net_pf"]
     print("\n" + "=" * 60)
     print(f"  SMC Bot — Phase-0 Gate  ({run_label}: smc_bot/ 15-step chain)")
     print("=" * 60)
     print(f"  Signal  : {htf_label} bias+Fib+OB/FVG → {ltf_label} sweep+disp+CHoCH")
-    print(f"  Symbol  : {SYMBOL}  HTF={htf_label}  LTF={ltf_label}  (bidirectional)")
+    print(f"  Symbol  : {SYMBOL}  HTF={htf_label}  LTF={ltf_label}  side={side}")
     print(f"  Exit    : TP={TARGET_R}R fixed  SL=sweep-wick±{SL_BUF*100:.1f}%")
     print(f"  Fee     : Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip")
     print("-" * 60)
@@ -549,6 +600,7 @@ def print_report(stats: dict, run_label: str = "Trial X", htf_label: str = "1H",
     print(f"  Gross PF: {gross_pf:.4f}")
     print(f"  Avg fee : {stats['avg_fee_r']:.4f} R")
     print(f"  Net PF  : {net_pf:.4f}")
+    print(f"  Expect. : {stats.get('expectancy', 0.0):+.4f} R/trade")
     print(f"  Max DD  : {stats['max_dd_r']:.4f} R")
     print("-" * 60)
 
@@ -560,6 +612,33 @@ def print_report(stats: dict, run_label: str = "Trial X", htf_label: str = "1H",
     print(f"  Gate net PF>1: {'PASS' if gate_pf else 'FAIL'}  (net PF={net_pf})")
     print(f"\n  VERDICT: {verdict}")
     print("=" * 60)
+
+    # ── Per-year breakdown ────────────────────────────────────────────────────
+    trades = stats.get("trades", [])
+    if trades:
+        by_year: dict[int, list] = {}
+        for t in trades:
+            try:
+                yr = int(str(t["ts"])[:4])
+            except (ValueError, TypeError):
+                yr = 0
+            by_year.setdefault(yr, []).append(t)
+
+        print(f"\n  {'Year':<6}  {'n':>4}  {'Win%':>5}  {'Gross PF':>8}  {'Net PF':>7}  {'Expect':>7}")
+        print(f"  {'-'*6}  {'-'*4}  {'-'*5}  {'-'*8}  {'-'*7}  {'-'*7}")
+        for yr in sorted(by_year):
+            yt  = by_year[yr]
+            yn  = len(yt)
+            yw  = sum(1 for t in yt if t["net_r"] > 0)
+            ywin = yw / yn * 100 if yn else 0.0
+            ygw  = sum(t["gross_r"] for t in yt if t["gross_r"] > 0)
+            ygl  = abs(sum(t["gross_r"] for t in yt if t["gross_r"] <= 0))
+            ynw  = sum(t["net_r"] for t in yt if t["net_r"] > 0)
+            ynl  = abs(sum(t["net_r"] for t in yt if t["net_r"] <= 0))
+            ygpf = ygw / ygl if ygl else float("inf")
+            ynpf = ynw / ynl if ynl else float("inf")
+            yexp = sum(t["net_r"] for t in yt) / yn
+            print(f"  {yr:<6}  {yn:>4}  {ywin:>4.0f}%  {ygpf:>8.3f}  {ynpf:>7.3f}  {yexp:>+7.3f}")
 
     if verdict == "PASS":
         print(f"\n  → Phase-0 cleared. Log {run_label} in VERDICT_LOG.md.")
@@ -575,19 +654,24 @@ def count_funnel(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
     """
     Count candidates surviving each AND-gated stage — diagnosis only.
     Stages match bot.py's 15-step signal chain exactly.
+    Includes Trial 6 zone-level mitigation stats.
     """
     htf_map = _align_htf(df_1h, df_5m)
 
     counts = {
-        "total_bars":   0,
-        "bias":         0,
-        "fib":          0,
-        "poi":          0,
-        "sweep":        0,
-        "displacement": 0,
-        "choch":        0,
+        "total_bars":       0,
+        "bias":             0,
+        "fib":              0,
+        "poi_raw":          0,   # bars touching any zone before mitigation filter
+        "poi":              0,   # bars touching a FRESH zone after mitigation filter
+        "sweep":            0,
+        "displacement":     0,
+        "choch":            0,
+        "zones_total":      0,   # cumulative zones detected across all htf_idx
+        "zones_mitigated":  0,   # cumulative zones rejected by mitigation filter
     }
 
+    # cache: htf_idx → (bias, raw_zones, fresh_zones)
     _htf_cache: dict[int, tuple] = {}
 
     for i in range(LTF_WARMUP, len(df_5m) - 1):
@@ -598,11 +682,14 @@ def count_funnel(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
         counts["total_bars"] += 1
 
         if htf_idx not in _htf_cache:
-            bias_val = _fast_bias(htf_idx)
-            pois_val = _fast_pois(htf_idx, bias_val)
-            _htf_cache[htf_idx] = (bias_val, pois_val)
+            bias_val  = _fast_bias(htf_idx)
+            raw_zones = _fast_pois_raw(htf_idx, bias_val)
+            fresh, rejected = _fast_filter_fresh(raw_zones, htf_idx, bias_val)
+            _htf_cache[htf_idx] = (bias_val, raw_zones, fresh)
+            counts["zones_total"]     += len(raw_zones)
+            counts["zones_mitigated"] += rejected
 
-        bias, pois = _htf_cache[htf_idx]
+        bias, raw_pois, pois = _htf_cache[htf_idx]
 
         if bias == "neutral":
             continue
@@ -613,6 +700,10 @@ def count_funnel(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
         if not _fast_fib_filter(htf_idx, price, bias):
             continue
         counts["fib"] += 1
+
+        # poi_raw: bar touches ANY zone (pre-mitigation)
+        if any(z["low"] <= price <= z["high"] for z in raw_pois):
+            counts["poi_raw"] += 1
 
         if not any(z["low"] <= price <= z["high"] for z in pois):
             continue
@@ -640,26 +731,36 @@ def print_funnel(counts: dict) -> None:
     stages = [
         ("bias",         "1H swing bias non-neutral"),
         ("fib",          "Fib 50% discount/premium"),
-        ("poi",          "Price inside 1H OB/FVG"),
+        ("poi",          "Price inside FRESH 1H OB/FVG"),
         ("sweep",        "5M liquidity sweep"),
         ("displacement", "5M displacement candle"),
         ("choch",        "5M CHoCH confirmed"),
     ]
     print("\n" + "=" * 60)
-    print("  PHASE-D FUNNEL  (bot.py 15-step signal chain, diagnosis only)")
+    print("  PHASE-D FUNNEL  (bot.py 15-step chain — Trial 6 mitigation)")
     print("=" * 60)
-    print(f"  {'Stage':<32}  {'n':>6}  {'%total':>7}  {'drop':>7}")
-    print(f"  {'-'*32}  {'-'*6}  {'-'*7}  {'-'*7}")
-    print(f"  {'Total candidate bars':<32}  {total:>6}")
+    print(f"  {'Stage':<34}  {'n':>6}  {'%total':>7}  {'drop':>7}")
+    print(f"  {'-'*34}  {'-'*6}  {'-'*7}  {'-'*7}")
+    print(f"  {'Total candidate bars':<34}  {total:>6}")
     prev = total
     for key, label in stages:
         n       = counts[key]
         pct     = n / total * 100 if total else 0.0
         dropped = prev - n
-        print(f"  {label:<32}  {n:>6}  {pct:>6.1f}%  {dropped:>6} ↓")
+        print(f"  {label:<34}  {n:>6}  {pct:>6.1f}%  {dropped:>6} ↓")
         prev = n
-    print(f"  {'─'*32}")
-    print(f"  {'→ SIGNALS (= choch)':<32}  {counts['choch']:>6}")
+    print(f"  {'─'*34}")
+    print(f"  {'→ SIGNALS (= choch)':<34}  {counts['choch']:>6}")
+    # Trial 6 mitigation summary
+    zt  = counts.get("zones_total", 0)
+    zm  = counts.get("zones_mitigated", 0)
+    prw = counts.get("poi_raw", 0)
+    poi = counts.get("poi", 0)
+    if zt:
+        zp = zm / zt * 100
+        print(f"\n  [Trial 6] Zones detected : {zt}")
+        print(f"  [Trial 6] Zones mitigated: {zm}  ({zp:.1f}% of all zones filtered out)")
+        print(f"  [Trial 6] Bar-level impact: poi_raw={prw} → poi_fresh={poi}  (−{prw - poi} bars)")
     print("=" * 60)
     if total and counts["choch"] < 50:
         prev2 = total
@@ -699,7 +800,9 @@ def main() -> None:
     parser.add_argument("--max-bars", type=int, default=None,
                         help="Limit LTF bars processed (profiling only — do NOT use for real trials)")
     parser.add_argument("--run-label", default=None,
-                        help="e.g. 'Trial 5' — appears in the report header")
+                        help="e.g. 'Trial 7' — appears in the report header")
+    parser.add_argument("--side", default="both", choices=["long", "short", "both"],
+                        help="Trade direction filter (default: both)")
     args = parser.parse_args()
 
     for label, path in [("HTF (1H)", args.htf), ("LTF (5M)", args.ltf)]:
@@ -735,8 +838,8 @@ def main() -> None:
     run_label = args.run_label or "Trial X"
 
     print("Running Phase-C backtest …", flush=True)
-    stats = run_backtest(df_1h, df_5m)
-    print_report(stats, run_label=run_label, htf_label=htf_label, ltf_label=ltf_label)
+    stats = run_backtest(df_1h, df_5m, side=args.side)
+    print_report(stats, run_label=run_label, htf_label=htf_label, ltf_label=ltf_label, side=args.side)
     sys.stdout.flush()
 
     print("Running Phase-D funnel …", flush=True)
