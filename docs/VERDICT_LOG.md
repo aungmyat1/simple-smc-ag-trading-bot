@@ -19,6 +19,15 @@ Fee model: Bybit taker 0.06%/side = 0.12% round trip.
 | 6 | 2026-06-16 | SMC Sniper bidirectional: same smc_bot/ 15-step chain (fib+mitigation+displacement), HTF=4H, LTF=1H. Long+short. 2R single exit. 4yr holdout (2022-06 → 2026-06). | 4H+1H | 85 | 1.0909 | 0.0633 | 0.9935 | 35.3% | **FAIL** (net PF misses by 0.0065; long sub-PF=0.69 destroys bidirectional; short sub-PF=1.33 at n=45 passes in isolation — see Trial 7) |
 | 7 | 2026-06-16 | SMC Sniper SHORT-ONLY: same 15-step chain (fib+displacement+mitigation), HTF=4H, LTF=1H, `--side short`. | 4H+1H | 1 | inf | 0.0424 | inf | 100% | **FAIL (n=1 — chain too restrictive)** Mitigation filter kills 76.5% of zones (97.4% bar-level drop poi_raw→poi_fresh). Only 3 CHoCH signals in 4yr holdout. Trial 6 (n=85) used OLD chain without fib/displacement/mitigation — not a valid baseline. Need to either relax mitigation filter or re-baseline. |
 
+> **2026-06-16 — Bot↔Gate alignment (code change, not a trial).** `smc_bot/bot.py`
+> had drifted *ahead* of the gate: it added a 5M OB/FVG retrace entry (steps 11–12)
+> and a BSL/SSL liquidity-pool TP (step 14) that `scripts/backtest.py` never
+> modelled — so Trials 4/5/5X measured a **simpler** chain than the deployed bot.
+> Reverted the bot to the gated chain: market entry on the signal bar, fixed
+> `risk.target_r` TP, single exit. `bot.py` and `backtest.py` are now the same
+> strategy, so Trials 4/5/5X **and** pre-registered Trial 6 describe the live bot.
+> Re-add the retrace entry or liquidity-pool TP only as a new, separately-gated trial.
+
 ---
 
 ## Diagnosis

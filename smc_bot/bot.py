@@ -4,19 +4,21 @@ SMC Bot — main loop.
 Run with:
     python -m smc_bot.bot
 
-Every 5M candle close (15-step workflow per CLAUDE.md §2):
-  1-2.  1H swing bias (bullish / bearish / neutral)
-  3.    Fib 50% filter — long only in discount, short only in premium
-  4.    1H OB/FVG POI zones marked
-  5.    HTF equal highs/lows identified as BSL/SSL targets
-  6.    Wait for price to tap a 1H POI zone
-  7-8.  5M liquidity sweep (stop-hunt of prior swing low/high)
-  9.    Post-sweep displacement candle confirmed (≥1.5×ATR)
-  10.   5M CHoCH (structural break confirming reversal)
-  11-12. 5M OB/FVG entry zone found; wait for price retrace into it
-  13.   SL placed at sweep wick ± buffer
-  14.   TP at nearest BSL/SSL pool (≥1.5R) or fallback 2R
-  15.   Partial plan: 50% at 1R → SL to BE → remainder at TP
+Every 5M candle close — gated SMC chain (matches scripts/backtest.py EXACTLY):
+  1-2. 1H swing bias (bullish / bearish / neutral)
+  3.   Fib 50% filter — long only in discount, short only in premium
+  4.   1H OB/FVG POI zones marked
+  5.   Wait for price to tap a 1H POI zone
+  6-7. 5M liquidity sweep (stop-hunt of prior swing low/high)
+  8.   Post-sweep displacement candle confirmed (>= N x ATR)
+  9.   5M CHoCH (structural break confirming reversal)
+  10.  Market entry; SL = sweep wick +/- buffer; TP = target_r (fixed R)
+
+NOTE (2026-06-16): the old 5M-retrace entry (steps 11-12) and the BSL/SSL
+liquidity-pool TP (step 14) were REMOVED so the live bot trades exactly what
+scripts/backtest.py gates. Trials 4/5/5X were run on this simpler chain; the
+richer variant was never gated. Re-add either piece only as a NEW, separately
+gated trial — never deploy un-gated logic.
 
 LIVE_TRADING=false by default — set manually in .env to enable real orders.
 Never modify LIVE_TRADING here; the owner controls it.
@@ -40,7 +42,7 @@ from dotenv import load_dotenv
 
 from smc_bot import (
     alerts, confirmation, data, executor, fib as fib_mod,
-    liquidity, poi, risk, structure, targets as tgt_mod,
+    liquidity, poi, risk, structure,
 )
 
 load_dotenv()
@@ -313,11 +315,12 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     # Shorts: price must be in premium zone (above 50% of swing range).
     price = float(df_5m["close"].iloc[-1])
     fib_mid = fib_mod.get_fib_midpoint(df_1h, bias, swing_n=swing_n)
-    if not fib_mod.fib_filter(price, bias, fib_mid):
+    # Match the gate (backtest.py): with no confirmed swing range, SKIP — do not
+    # pass through. fib_filter() returns True for a None midpoint, so guard here.
+    if fib_mid is None or not fib_mod.fib_filter(price, bias, fib_mid):
         log.info(
-            "Fib filter: price=%.2f not in %s zone (mid=%.2f)",
-            price, "discount" if bias == "bullish" else "premium",
-            fib_mid or 0,
+            "Fib filter: price=%.2f not in %s zone (mid=%s)",
+            price, "discount" if bias == "bullish" else "premium", fib_mid,
         )
         return
 
@@ -341,21 +344,14 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         log.info("No fresh 1H POI zones after mitigation filter")
         return
 
-    # ── STEP 5: Identify HTF equal lows/highs as TP target (BSL/SSL) ─────────
-    tc = cfg.get("targets", {})
-    tgt_swing_n   = cfg["structure"]["swing_n"]
-    tgt_tolerance = tc.get("equal_level_tolerance", 0.002)
-    tgt_min_r     = tc.get("min_r", 1.5)
-    tgt_fallback  = tc.get("fallback_r", 2.0)
-
-    # ── STEP 6: Wait for price to tap POI ────────────────────────────────────
+    # ── STEP 5: Wait for price to tap a 1H POI ───────────────────────────────
     active = poi.price_in_poi(price, pois)
     if active is None:
         log.info("Price %.2f not yet in any %s POI", price, bias)
         return
     log.info("Price in 1H %s POI [%.2f – %.2f]", active["kind"], active["low"], active["high"])
 
-    # ── STEP 7-8: 5M sweep ───────────────────────────────────────────────────
+    # ── STEP 6-7: 5M liquidity sweep ─────────────────────────────────────────
     lc = cfg["liquidity"]
     sweep = liquidity.get_sweep(
         df_5m,
@@ -371,9 +367,7 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         sweep["bar_idx"], sweep["swept_level"], sweep["wick_extreme"],
     )
 
-    # ── STEP 9: Bullish/bearish displacement after sweep ─────────────────────
-    # A strong institutional candle (≥ N×ATR) in the trade direction must
-    # appear after the sweep bar — proves momentum, not just noise.
+    # ── STEP 8: Post-sweep displacement candle (>= N x ATR, trade direction) ──
     disp_atr = lc.get("displacement_atr", cfg["poi"]["displacement_atr"])
     if not liquidity.check_displacement(df_5m, sweep["bar_idx"], bias, atr_mult=disp_atr):
         log.info("No displacement candle after sweep (bias=%s)", bias)
@@ -381,7 +375,7 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     mss_strength = liquidity.displacement_strength(df_5m, sweep["bar_idx"], bias)
     log.info("Displacement confirmed after sweep (%s)", mss_strength)
 
-    # ── STEP 10: Break of minor structure (CHoCH) ─────────────────────────────
+    # ── STEP 9: Break of minor structure (CHoCH) ─────────────────────────────
     choch = confirmation.get_choch(
         df_5m, bias, sweep, lookback=cfg["confirmation"]["lookback"]
     )
@@ -390,32 +384,10 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         return
     log.info("CHoCH confirmed (%s)", bias)
 
-    # ── STEPS 11-12: Mark 5M OB/FVG → enter on RETRACE into that zone ────────
-    # After CHoCH, identify the 5M OB/FVG formed by the displacement candle.
-    # Only enter when price RETRACES into that zone (limit-level, not market).
-    ltf_zones = poi.get_ltf_pois(
-        df_5m, bias, sweep["bar_idx"],
-        displacement_atr = disp_atr,
-        lookback         = lc.get("ltf_poi_lookback", 15),
-    )
-    if ltf_zones:
-        ltf_entry_zone = poi.price_in_poi(price, ltf_zones)
-        if ltf_entry_zone is None:
-            log.info(
-                "CHoCH confirmed but price %.2f not yet in 5M OB/FVG — waiting for retrace",
-                price,
-            )
-            return
-        log.info(
-            "Price in 5M %s zone [%.2f – %.2f] — entry triggered",
-            ltf_entry_zone["kind"], ltf_entry_zone["low"], ltf_entry_zone["high"],
-        )
-    else:
-        # No 5M OB/FVG detected (can happen on very fast moves); enter at market.
-        ltf_entry_zone = None
-        log.info("No 5M OB/FVG found; proceeding to market entry")
-
-    # ── STEP 13: SL below/above sweep wick ───────────────────────────────────
+    # ── STEP 10: Market entry — SL at sweep wick ± buffer, TP at fixed R ──────
+    # The old 5M-retrace entry and BSL/SSL liquidity-pool TP were removed so this
+    # path is byte-for-byte the strategy scripts/backtest.py gates. Enter at
+    # market on the signal bar; the backtest models the fill at next-bar open.
     buf = rc["sl_buffer"]
     if bias == "bullish":
         sl   = sweep["wick_extreme"] * (1.0 - buf)
@@ -429,21 +401,8 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         log.warning("stop_dist=0; skipping")
         return
 
-    # ── STEP 14: TP at previous highs/lows (BSL/SSL) with 2R fallback ────────
-    # Prefer the nearest equal-highs cluster (longs) / equal-lows cluster (shorts)
-    # that gives ≥ min_r reward.  Fall back to fixed fallback_r if none found.
-    tp = tgt_mod.get_tp_level(
-        df_1h, bias, price, stop_dist,
-        swing_n   = tgt_swing_n,
-        tolerance = tgt_tolerance,
-        min_r     = tgt_min_r,
-    )
-    if tp is None:
-        tp = price + tgt_fallback * stop_dist if side == "Buy" else price - tgt_fallback * stop_dist
-        log.info("No BSL/SSL TP found — using %.1fR fallback: %.2f", tgt_fallback, tp)
-    else:
-        achieved_r = abs(tp - price) / stop_dist
-        log.info("TP at liquidity pool %.2f (%.2fR)", tp, achieved_r)
+    target_r = rc["target_r"]
+    tp = price + target_r * stop_dist if side == "Buy" else price - target_r * stop_dist
 
     qty = risk.calc_qty(balance, price, sl, rc["risk_pct"])
     if qty <= 0:
@@ -454,18 +413,8 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     mode        = "SIGNAL_ONLY" if signal_only else "EXECUTE"
 
     log.info(
-        "[%s] %s | entry=%.2f SL=%.2f TP=%.2f R=%.2f qty=%s",
-        mode, side, price, sl, tp, abs(tp - price) / stop_dist, qty,
-    )
-
-    # ── STEP 15: Partial exit plan (logged; live execution deferred) ──────────
-    pc = cfg.get("partials", {})
-    tp1_r   = pc.get("tp1_r", 1.0)
-    tp1_pct = pc.get("tp1_pct", 0.50)
-    tp1_price = price + tp1_r * stop_dist if side == "Buy" else price - tp1_r * stop_dist
-    log.info(
-        "Partial plan: TP1 %.0f%% @ %.2f (1R=%.2fR), TP2 @ %.2f (BSL/SSL), SL→BE after TP1",
-        tp1_pct * 100, tp1_price, tp1_r, tp,
+        "[%s] %s | entry=%.2f SL=%.2f TP=%.2f (%.1fR) qty=%s",
+        mode, side, price, sl, tp, target_r, qty,
     )
 
     # ── Signal log / trade journal (always written) ───────────────────────────
@@ -473,13 +422,9 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     session, kill_zone = _session_and_killzone(now)
     trade_id  = f"{now.strftime('%Y%m%d')}_{sym}_{now.strftime('%H%M%S')}"
     poi_label = f"1H {bias.capitalize()} {'Order Block' if active['kind'] == 'OB' else 'FVG'}"
-    entry_type = (
-        f"{'OB' if ltf_entry_zone['kind'] == 'OB' else 'FVG'} Retest"
-        if ltf_entry_zone else "Market"
-    )
-    risk_pts      = round(abs(price - sl), 2)
-    reward_tp1    = round(abs(tp1_price - price), 2)
-    reward_tp2    = round(abs(tp - price), 2)
+    entry_type     = "Market"   # gated chain: market entry on the signal bar (no 5M retrace)
+    risk_pts       = round(abs(price - sl), 2)
+    reward_tp2     = round(abs(tp - price), 2)
     planned_rr_tp2 = round(abs(tp - price) / stop_dist, 2) if stop_dist else ""
 
     _log_signal({
@@ -501,12 +446,12 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         "Entry TF":               "5M",
         "Entry Price":            round(price, 2),
         "Stop Loss":              round(sl, 2),
-        "TP1":                    round(tp1_price, 2),
+        "TP1":                    "",
         "TP2":                    round(tp, 2),
         "Risk (pips)":            risk_pts,
-        "Reward TP1 (pips)":      reward_tp1,
+        "Reward TP1 (pips)":      "",
         "Reward TP2 (pips)":      reward_tp2,
-        "Planned RR TP1":         round(tp1_r, 2),
+        "Planned RR TP1":         "",
         "Planned RR TP2":         planned_rr_tp2,
         "MAE":                    "",
         "MFE":                    "",
@@ -523,7 +468,7 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     if signal_only:
         alerts.send(
             f"📊 SMC Bot [{sym}] SIGNAL {side} | entry={price:.0f} "
-            f"SL={sl:.0f} TP1={tp1_price:.0f} TP={tp:.0f} qty={qty} (SIGNAL_ONLY)"
+            f"SL={sl:.0f} TP={tp:.0f} ({target_r:.1f}R) qty={qty} (SIGNAL_ONLY)"
         )
         return
 

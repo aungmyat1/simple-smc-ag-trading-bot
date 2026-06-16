@@ -644,16 +644,13 @@ def _proximity_html(pipe: dict, position: dict) -> str:
         buf    = CFG["risk"]["sl_buffer"]
         sl_p   = sw_wk * (1 - buf) if bias == "bullish" else sw_wk * (1 + buf)
         r_dist = abs(price - sl_p)
-        tc     = CFG.get("targets", {})
-        tp_r   = tc.get("fallback_r", 2.0)
+        tp_r   = CFG["risk"]["target_r"]
         tp_p   = price + r_dist * tp_r if bias == "bullish" else price - r_dist * tp_r
-        tp1_p  = price + r_dist if bias == "bullish" else price - r_dist
         title  = f"{'▲ LONG' if bias=='bullish' else '▼ SHORT'} SIGNAL ACTIVE"
         desc   = (
-            f"All 5 conditions met. Entry at ~{cp}, "
+            f"All conditions met. <strong>Market entry</strong> at ~{cp}, "
             f"SL at ${sl_p:,.0f} (sweep wick ${sw_wk:,.0f}), "
-            f"TP1 at ${tp1_p:,.0f} (1R, 50% off → SL→BE), "
-            f"TP2 at ${tp_p:,.0f} ({tp_r}R or nearest BSL/SSL pool)."
+            f"TP at ${tp_p:,.0f} (fixed {tp_r}R — single exit, no partials)."
         )
         next_action = "CONFIRM token required before any order is placed (CLAUDE.md §7)."
 
@@ -865,8 +862,8 @@ def _checklist_html() -> str:
       <div class="cl-h2">4 · Liquidity Story</div>
       {item("c4a","Liquidity marked: equal highs/lows, prior session H/L, swing points.")}
       {item("c4b","Know what price is likely to sweep <strong>before</strong> the move.")}
-      {item("c4c","Know what liquidity I am targeting <strong>after</strong> entry.")}
-      {item("c4d","Target pool is large enough to justify the risk.")}
+      {item("c4c","Sweep is of a real pool (equal highs/lows, session or swing H/L).")}
+      {item("c4d","Fixed 2R target is reachable before the next opposing pool.")}
     </div>"""
 
     s5 = f"""
@@ -876,7 +873,7 @@ def _checklist_html() -> str:
       {item("c5b","A <strong>liquidity sweep</strong> occurred inside/just before the zone.")}
       {item("c5c","A valid <strong>5M CHoCH / MSS / BOS</strong> formed after the sweep.")}
       {item("c5d","Displacement leg created a new 5M OB and/or FVG.")}
-      {item("c5e","Waiting for retrace into execution zone, not chasing the impulse.")}
+      {item("c5e","5M CHoCH close confirmed — gated bot enters at <strong>market</strong> on this bar (no retrace wait).")}
     </div>"""
 
     s6 = f"""
@@ -884,11 +881,10 @@ def _checklist_html() -> str:
       <div class="cl-h2">6 · Entry Model</div>
       <table class="cl-table">
         <tr><th>Type</th><th>When</th><th>Entry</th></tr>
-        <tr><td><strong>Confirmation</strong></td><td>Default model</td><td>Retrace into 5M OB/FVG after sweep + CHoCH</td></tr>
-        <tr><td>Refined</td><td>Very clean setup</td><td>50% of impulse / OB midpoint / FVG midpoint</td></tr>
-        <tr><td>Aggressive</td><td>Exceptional confluence only</td><td>Direct touch of HTF POI with defined SL</td></tr>
+        <tr><td><strong>Gated bot</strong></td><td>Default (automated)</td><td>Market on the 5M CHoCH close — no retrace wait</td></tr>
+        <tr><td>Manual retrace</td><td>Hand-trading only</td><td>Optional: wait for retrace into 5M OB/FVG (not what the bot does)</td></tr>
       </table>
-      {item("c6a","Default choice: Confirmation. Aggressive only if confluence is exceptional.")}
+      {item("c6a","Automated chain enters at market on the CHoCH close (single fixed-R exit).")}
     </div>"""
 
     s7 = f"""
@@ -903,10 +899,10 @@ def _checklist_html() -> str:
     s8 = f"""
     <div class="cl-card">
       <div class="cl-h2">8 · Take Profit Rules</div>
-      {item("c8a","TP1 = nearest internal liquidity / first logical reaction point.")}
-      {item("c8b","TP2 = structural high/low or external liquidity (BSL/SSL).")}
-      {item("c8c","Exit plan is defined <strong>before</strong> entry.")}
-      {item("c8d","Minimum R:R acceptable for setup type (Confirmation ≥ 1:2).")}
+      {item("c8a","TP = <strong>fixed 2R</strong> from entry — single exit, no partials.")}
+      {item("c8b","TP is set at entry and not trailed or scaled out.")}
+      {item("c8c","Exit plan (SL + 2R TP) is defined <strong>before</strong> entry.")}
+      {item("c8d","Fixed R:R = 2:1; 2R must clear the 0.12% round-trip fee.")}
     </div>"""
 
     s9 = f"""

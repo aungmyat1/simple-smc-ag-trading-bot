@@ -1,15 +1,20 @@
 """
-Phase-0 gate: smc_bot/ 15-step SMC chain on Bybit 1H+5M.
+Phase-0 gate: smc_bot/ gated SMC chain on Bybit 1H+5M (bidirectional).
 
-Signal chain (matches smc_bot/bot.py exactly — all 15 workflow steps):
-  structure.get_bias  →  fib.fib_filter (50% discount/premium)
-  → poi.get_pois → price_in_poi
-  → liquidity.get_sweep → check_displacement
-  → confirmation.get_choch
+Signal chain — matches smc_bot/bot.py EXACTLY (verified line-by-line):
+  structure.get_bias  →  fib 50% discount/premium
+  → poi.get_pois → price_in_poi (price taps a 1H POI)
+  → liquidity sweep → post-sweep displacement (>= N x ATR)
+  → confirmation CHoCH
 
-Exit model (matches smc_bot/bot.py):
-  TP at targets.get_tp_level (BSL/SSL pool ≥ min_r) or fallback_r × risk.
-  SL = sweep wick × (1 ± sl_buffer).
+Exit model — matches smc_bot/bot.py:
+  Entry : market on the signal bar (modelled here as next-bar open).
+  SL    : sweep wick × (1 ∓ sl_buffer).
+  TP    : fixed risk.target_r × risk.  Single exit — no partials, no pools.
+
+NOTE: a 5M-retrace entry and a BSL/SSL liquidity-pool TP briefly lived in
+bot.py; both were removed (2026-06-16) so the gate and the live bot are the
+SAME strategy. Re-add either only as a new, separately-gated trial.
 
 Fee model: Bybit taker 0.06%/side = 0.12% round trip (net-of-fees only).
 
@@ -20,7 +25,7 @@ No imports from _archive/ in this file.
 
 Performance notes:
   All O(N²) bottlenecks replaced with precomputed arrays + bisect lookups.
-  Signal results are mathematically identical to smc_bot/ chain.
+  Signal results are mathematically identical to the smc_bot/ chain.
 
 Usage:
     python3 scripts/backtest.py
@@ -56,7 +61,7 @@ def _load_cfg() -> dict:
 _CFG      = _load_cfg()
 SYMBOL    = _CFG["exchange"]["symbol"]                          # BTCUSDT
 SL_BUF    = _CFG["risk"]["sl_buffer"]                          # 0.001
-TARGET_R  = _CFG["risk"]["target_r"]                           # 2.0 (fallback)
+TARGET_R  = _CFG["risk"]["target_r"]                           # 2.0 — fixed TP (single exit)
 SWING_N   = _CFG["structure"]["swing_n"]                       # 5
 OB_LB     = _CFG["poi"]["ob_lookback"]                         # 50
 FVG_LB    = _CFG["poi"]["fvg_lookback"]                        # 30
@@ -66,7 +71,6 @@ LIQ_LB    = _CFG["liquidity"]["lookback"]                      # 30
 DISP_ATR_LTF = _CFG["liquidity"].get("displacement_atr", 1.5) # 1.5 (5M displacement gate)
 CHOCH_LB  = _CFG["confirmation"]["lookback"]                   # 10
 FIB_LEVEL = _CFG.get("fib", {}).get("level", 0.5)             # 0.5 = 50% midpoint
-TGT_FALLBACK = _CFG.get("targets", {}).get("fallback_r", 2.0) # 2.0
 
 TAKER_FEE  = 0.0006   # Bybit taker 0.06%/side (not in config.yaml — exchange constant)
 ROUND_TRIP = TAKER_FEE * 2
@@ -489,7 +493,7 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
             stop_dist   = entry_price - sl
             if stop_dist <= 0:
                 continue
-            tp = entry_price + TGT_FALLBACK * stop_dist
+            tp = entry_price + TARGET_R * stop_dist
 
             exit_price, exit_reason, exit_bar = _scan_exit(
                 high_5m, low_5m, entry_bar, sl, tp
@@ -513,7 +517,7 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
             stop_dist   = sl - entry_price
             if stop_dist <= 0:
                 continue
-            tp = entry_price - TGT_FALLBACK * stop_dist
+            tp = entry_price - TARGET_R * stop_dist
 
             exit_price, exit_reason, exit_bar = _scan_exit_short(
                 high_5m, low_5m, entry_bar, sl, tp
@@ -588,7 +592,7 @@ def print_report(
     print("=" * 60)
     print(f"  Signal  : {htf_label} bias+Fib+OB/FVG → {ltf_label} sweep+disp+CHoCH")
     print(f"  Symbol  : {SYMBOL}  HTF={htf_label}  LTF={ltf_label}  side={side}")
-    print(f"  Exit    : TP={TGT_FALLBACK}R fallback  SL=sweep-wick±{SL_BUF*100:.1f}%")
+    print(f"  Exit    : TP={TARGET_R}R fixed  SL=sweep-wick±{SL_BUF*100:.1f}%")
     print(f"  Fee     : Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip")
     print("-" * 60)
     print(f"  Trades  : {n}")
