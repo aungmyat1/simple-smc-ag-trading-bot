@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-from smc_bot import confirmation, data, executor, liquidity, poi, structure  # noqa: E402
+from smc_bot import confirmation, data, executor, fib as fib_mod, liquidity, poi, structure  # noqa: E402
 
 with open(ROOT / "smc_bot" / "config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -89,13 +89,27 @@ def _position() -> dict:
 
 def _analyze_pipeline(df_1h, df_5m) -> dict:
     """
-    Full pipeline analysis. Returns every level the chart needs:
-    poi_zones, sweep_bar, sweep_level, sweep_wick, choch_ref_level.
+    Full 15-step pipeline analysis.
+
+    Stages 0-5:
+      0 = no 1H bias
+      1 = bias set (not in Fib zone or POI yet)
+      2 = in Fib zone + in POI (watching for sweep)
+      3 = sweep confirmed (watching for displacement)
+      4 = displacement confirmed (waiting for CHoCH)
+      5 = CHoCH confirmed → SIGNAL
     """
     try:
-        price = float(df_5m["close"].iloc[-1])
-        bias  = structure.get_bias(df_1h, swing_n=CFG["structure"]["swing_n"])
+        price   = float(df_5m["close"].iloc[-1])
+        swing_n = CFG["structure"]["swing_n"]
+        bias    = structure.get_bias(df_1h, swing_n=swing_n)
 
+        # ── Fib 50% filter ────────────────────────────────────────────────────
+        fib_mid    = fib_mod.get_fib_midpoint(df_1h, bias, swing_n=swing_n) if bias != "neutral" else None
+        fib_ok     = fib_mod.fib_filter(price, bias, fib_mid) if fib_mid is not None else False
+        fib_zone   = "discount" if bias == "bullish" else "premium"
+
+        # ── 1H POI zones ──────────────────────────────────────────────────────
         poi_zones_raw = poi.get_pois(
             df_1h, bias,
             ob_lookback=CFG["poi"]["ob_lookback"],
@@ -103,68 +117,99 @@ def _analyze_pipeline(df_1h, df_5m) -> dict:
             displacement_atr=CFG["poi"]["displacement_atr"],
         ) if bias != "neutral" else []
 
-        # Serialisable zone dicts (no numpy scalars)
-        poi_zones = [
+        poi_zones  = [
             {"kind": z["kind"], "low": float(z["low"]), "high": float(z["high"])}
             for z in poi_zones_raw
         ]
-
         active_poi = poi.price_in_poi(price, poi_zones) if poi_zones else None
 
-        sweep_result = liquidity.get_sweep(
-            df_5m, bias,
-            lookback=CFG["liquidity"]["lookback"],
-            swing_n=CFG["liquidity"]["swing_n"],
-        ) if bias != "neutral" else None
+        # Nearest POI for distance display
+        nearest_poi, nearest_dist = None, float("inf")
+        if poi_zones and not active_poi:
+            for z in poi_zones:
+                d = abs(price - (z["low"] + z["high"]) / 2)
+                if d < nearest_dist:
+                    nearest_dist, nearest_poi = d, z
 
-        # CHoCH reference level (swing high/low before the sweep bar)
+        # ── 5M sweep ──────────────────────────────────────────────────────────
+        sweep_result = None
+        if bias != "neutral":
+            if bias == "bullish":
+                sweep_result = liquidity.get_sweep(df_5m, bias,
+                    lookback=CFG["liquidity"]["lookback"],
+                    swing_n=CFG["liquidity"]["swing_n"])
+            else:
+                # bearish: sweep of swing highs (BSL sweep)
+                sweep_result = liquidity.get_sweep(df_5m, bias,
+                    lookback=CFG["liquidity"]["lookback"],
+                    swing_n=CFG["liquidity"]["swing_n"])
+
+        # ── Displacement ───────────────────────────────────────────────────────
+        displacement = False
+        if sweep_result:
+            displacement = liquidity.check_displacement(
+                df_5m, sweep_result["bar_idx"], bias,
+                atr_mult=CFG["liquidity"].get("displacement_atr", CFG["poi"]["displacement_atr"]),
+            )
+
+        # ── CHoCH ─────────────────────────────────────────────────────────────
         choch_ref_level = None
         choch = False
         if sweep_result:
-            sb  = sweep_result["bar_idx"]
-            lb  = CFG["confirmation"]["lookback"]
-            rs  = max(0, sb - lb)
+            sb = sweep_result["bar_idx"]
+            lb = CFG["confirmation"]["lookback"]
+            rs = max(0, sb - lb)
             if bias == "bullish":
                 choch_ref_level = float(np.max(df_5m["high"].values[rs : sb + 1]))
             else:
                 choch_ref_level = float(np.min(df_5m["low"].values[rs : sb + 1]))
             choch = bool(confirmation.get_choch(df_5m, bias, sweep_result, lookback=lb))
 
-        # Nearest POI (for stage-1 distance display)
-        nearest_poi = None
-        nearest_dist = float("inf")
-        if poi_zones and not active_poi:
-            for z in poi_zones:
-                mid = (z["low"] + z["high"]) / 2
-                d   = abs(price - mid)
-                if d < nearest_dist:
-                    nearest_dist, nearest_poi = d, z
-
-        # Stage + blocker
+        # ── Stage + blocker ────────────────────────────────────────────────────
         if bias == "neutral":
             stage, blocker = 0, "No clear 1H structure (need HH+HL or LL+LH)"
-        elif not poi_zones:
-            stage, blocker = 1, "No POI zones detected on 1H"
-        elif not active_poi:
-            near = nearest_poi
-            dist_str = f"${nearest_dist:,.0f} away" if nearest_poi else "—"
-            stage, blocker = 1, f"Price not in POI yet — {dist_str}"
+        elif not fib_ok or not active_poi:
+            if not fib_ok and fib_mid:
+                dir_ = "≤" if bias == "bullish" else "≥"
+                stage = 1
+                blocker = (
+                    f"Fib filter: price ${price:,.0f} not in {fib_zone} "
+                    f"(need {dir_} ${fib_mid:,.0f})"
+                )
+            elif not poi_zones:
+                stage, blocker = 1, "No 1H OB/FVG zones detected"
+            else:
+                dist_str = f"${nearest_dist:,.0f} away" if nearest_poi else "—"
+                stage    = 1
+                blocker  = f"Fib OK but price not in POI yet — nearest {dist_str}"
         elif not sweep_result:
             swing_dir = "low" if bias == "bullish" else "high"
-            stage, blocker = 2, f"In POI — watching for 5M swing {swing_dir} sweep"
+            stage     = 2
+            blocker   = f"In POI + Fib {fib_zone} — watching for 5M swing {swing_dir} sweep"
+        elif not displacement:
+            stage   = 3
+            sw_lv   = sweep_result["swept_level"]
+            sw_wk   = sweep_result["wick_extreme"]
+            blocker = (
+                f"Sweep of ${sw_lv:,.0f} confirmed (wick ${sw_wk:,.0f}) — "
+                f"waiting for displacement candle (≥{CFG['poi']['displacement_atr']}×ATR)"
+            )
         elif not choch:
             ref_str = f"${choch_ref_level:,.0f}" if choch_ref_level else "—"
             brk_dir = "above" if bias == "bullish" else "below"
-            stage, blocker = 3, f"Sweep confirmed — close {brk_dir} {ref_str} to trigger CHoCH"
+            stage   = 4
+            blocker = f"Displacement confirmed — close {brk_dir} {ref_str} to trigger CHoCH"
         else:
-            stage, blocker = 4, None
+            stage, blocker = 5, None
 
-        signal = ("LONG" if bias == "bullish" else "SHORT") if stage == 4 else "FLAT"
+        signal = ("LONG" if bias == "bullish" else "SHORT") if stage == 5 else "FLAT"
 
         return {
             "ok":              True,
             "price":           price,
             "bias":            bias,
+            "fib_mid":         fib_mid,
+            "fib_ok":          fib_ok,
             "poi_zones":       poi_zones,
             "active_poi":      active_poi,
             "nearest_poi":     nearest_poi,
@@ -175,6 +220,7 @@ def _analyze_pipeline(df_1h, df_5m) -> dict:
             "sweep_bar":       int(sweep_result["bar_idx"]) if sweep_result else None,
             "sweep_level":     float(sweep_result["swept_level"]) if sweep_result else None,
             "sweep_wick":      float(sweep_result["wick_extreme"]) if sweep_result else None,
+            "displacement":    displacement,
             "choch":           bool(choch),
             "choch_ref_level": choch_ref_level,
             "signal":          signal,
@@ -184,7 +230,7 @@ def _analyze_pipeline(df_1h, df_5m) -> dict:
     except Exception as exc:
         import traceback; traceback.print_exc()
         return {"ok": False, "error": str(exc), "price": 0, "bias": "—", "signal": "—", "stage": 0,
-                "poi_zones": [], "sweep": False, "choch": False}
+                "poi_zones": [], "sweep": False, "displacement": False, "choch": False}
 
 
 def _trades(n: int = 25) -> list[dict]:
@@ -457,8 +503,8 @@ def _render_chart_svg(df_5m, pipe: dict, position: dict) -> str:
 
     # ── stage badge (top-right of chart) ──────────────────────────────────────
     stage = pipe.get("stage", 0)
-    stage_lbl = f"Stage {stage}/4 · {['NO BIAS','POI','SWEEP','CHoCH','SIGNAL'][min(stage,4)]}"
-    scol = ["#4a5568", "#d29922", "#e3b341", "#58a6ff", "#3fb950"][min(stage, 4)]
+    stage_lbl = f"Stage {stage}/5 · {['NO BIAS','BIAS','FIB+POI','SWEEP','DISP','SIGNAL'][min(stage,5)]}"
+    scol = ["#4a5568", "#d29922", "#e3b341", "#58a6ff", "#c97dff", "#3fb950"][min(stage, 5)]
     o.append(f'<rect x="{ML+CW-145}" y="{MT+5}" width="143" height="22" rx="4" fill="#161b22" stroke="{scol}" stroke-width="1" opacity="0.95"/>')
     o.append(f'<text x="{ML+CW-72}" y="{MT+18}" text-anchor="middle" fill="{scol}" font-family="monospace" font-size="9" font-weight="bold">{stage_lbl}</text>')
 
@@ -481,28 +527,29 @@ def _proximity_html(pipe: dict, position: dict) -> str:
     bias  = pipe.get("bias", "neutral")
     signal= pipe.get("signal", "FLAT")
 
-    # Stage progress bar — 4 steps interleaved with 3 connectors
+    # Stage progress bar — 5 steps interleaved with 4 connectors
     steps = [
         ("1H Bias",   stage >= 1),
-        ("In POI",    stage >= 2),
+        ("Fib+POI",   stage >= 2),
         ("5M Sweep",  stage >= 3),
-        ("5M CHoCH",  stage >= 4),
+        ("Displace",  stage >= 4),
+        ("5M CHoCH",  stage >= 5),
     ]
 
     bar_parts: list[str] = []
-    for i, (label, done) in enumerate(steps):
+    for idx, (label, done) in enumerate(steps):
         col, icon, bg = ("#3fb950", "✅", "#1a3a1a") if done else ("#4a5568", "⬜", "#0d1117")
         bar_parts.append(
-            f'<div style="flex:1;text-align:center;padding:8px 4px;background:{bg};'
+            f'<div style="flex:1;text-align:center;padding:6px 3px;background:{bg};'
             f'border-radius:5px;border:1px solid {col}30">'
-            f'<div style="font-size:16px">{icon}</div>'
-            f'<div style="font-size:10px;color:{col};margin-top:3px;font-weight:600">{label}</div>'
+            f'<div style="font-size:14px">{icon}</div>'
+            f'<div style="font-size:9px;color:{col};margin-top:2px;font-weight:600">{label}</div>'
             f'</div>'
         )
-        if i < len(steps) - 1:
+        if idx < len(steps) - 1:
             ac = "#3fb950" if done else "#2a2a2a"
             bar_parts.append(
-                f'<div style="display:flex;align-items:center;color:{ac};font-size:12px;padding:0 3px">→</div>'
+                f'<div style="display:flex;align-items:center;color:{ac};font-size:11px;padding:0 2px">→</div>'
             )
     step_bar_html = "".join(bar_parts)
 
@@ -520,67 +567,97 @@ def _proximity_html(pipe: dict, position: dict) -> str:
         next_action = "Watch for 1H to form a clear HH+HL (bullish) or LL+LH (bearish) sequence."
 
     elif stage == 1:
-        near = pipe.get("nearest_poi")
-        if near:
-            dist = abs(price - (near["low"] if bias == "bullish" else near["high"]))
-            dir_ = "rally to" if bias == "bullish" else "sell off to"
-            zone_str = f'${near["low"]:,.0f} – ${near["high"]:,.0f}'
-            title = f"Watching for Price to Enter {near['kind']} Zone"
+        fib_mid = pipe.get("fib_mid")
+        near    = pipe.get("nearest_poi")
+        fib_ok  = pipe.get("fib_ok", False)
+        if not fib_ok and fib_mid:
+            dir_  = "discount (≤" if bias == "bullish" else "premium (≥"
+            title = "Waiting for Fib Discount/Premium Zone"
             desc  = (
                 f"1H bias is <strong>{'▲ BULLISH' if bias=='bullish' else '▼ BEARISH'}</strong>. "
-                f"A {near['kind']} zone exists at {zone_str}. "
-                f"Current price {cp} is ${dist:,.0f} away. "
-                f"No trade setup until price {dir_} the zone."
+                f"Fib 50% midpoint is ${fib_mid:,.0f}. Current price {cp} is not yet in the "
+                f"{dir_} ${fib_mid:,.0f}) zone. The bot only looks for longs in discount and shorts in premium."
+            )
+            next_action = f"Wait for price to enter the {'discount (below' if bias=='bullish' else 'premium (above'} ${fib_mid:,.0f})."
+        elif near:
+            dist = abs(price - (near["low"] + near["high"]) / 2)
+            dir_ = "rally into" if bias == "bullish" else "sell into"
+            zone_str = f'${near["low"]:,.0f} – ${near["high"]:,.0f}'
+            title = f"Fib OK — Watching for Price to Enter {near['kind']} Zone"
+            desc  = (
+                f"1H bias is <strong>{'▲ BULLISH' if bias=='bullish' else '▼ BEARISH'}</strong>. "
+                f"Fib discount/premium filter passed. "
+                f"A {near['kind']} zone exists at {zone_str} — ${dist:,.0f} away. "
+                f"No trade setup until price enters the POI."
             )
             next_action = f"Wait for price to {dir_} the {near['kind']} at {zone_str}."
         else:
             title = "No POI Zones Found"
-            desc  = f"1H bias is {'bullish' if bias=='bullish' else 'bearish'} but no OB or FVG zones detected. Displacement threshold may need tuning."
-            next_action = "Monitor for a displacement candle to form a new OB or FVG."
+            desc  = f"1H bias is {'bullish' if bias=='bullish' else 'bearish'} but no OB or FVG zones detected."
+            next_action = "Monitor for a displacement candle to form a new 1H OB or FVG."
 
     elif stage == 2:
         apoi = pipe.get("active_poi") or {}
         swing_dir = "swing low" if bias == "bullish" else "swing high"
         sweep_dir = "below" if bias == "bullish" else "above"
-        title = f"Price in {apoi.get('kind','POI')} Zone — Watching for Sweep"
-        desc  = (
-            f"Price {cp} is inside the {apoi.get('kind','POI')} zone "
-            f"[${apoi.get('low',0):,.0f} – ${apoi.get('high',0):,.0f}]. "
-            f"Waiting for a 5M candle wick to pierce {sweep_dir} a prior {swing_dir} "
-            f"and close back inside — this is the stop-hunt (inducement sweep) that "
-            f"signals smart money absorbed retail stops."
+        fib_mid   = pipe.get("fib_mid")
+        mid_str   = f" (${fib_mid:,.0f})" if fib_mid else ""
+        poi_lo = f"${apoi.get('low', 0):,.0f}"
+        poi_hi = f"${apoi.get('high', 0):,.0f}"
+        title  = f"In Fib{mid_str} + {apoi.get('kind','POI')} Zone — Waiting for Sweep"
+        desc   = (
+            f"Price {cp} is in the {'discount' if bias=='bullish' else 'premium'} zone "
+            f"and inside the 1H {apoi.get('kind','POI')} [{poi_lo} – {poi_hi}]. "
+            f"Now watching 5M for a stop-hunt: wick piercing {sweep_dir} a prior {swing_dir} "
+            f"and closing back — the inducement sweep that shows smart money absorbed retail stops."
         )
-        next_action = f"Watch 5M for a wick piercing {sweep_dir} a recent {swing_dir} with a close back above/inside the zone."
+        next_action = f"Watch 5M for a wick {sweep_dir} a recent {swing_dir} with close back above/below it."
 
     elif stage == 3:
+        sw_lv  = pipe.get("sweep_level", 0)
+        sw_wk  = pipe.get("sweep_wick", 0)
+        d_atr  = CFG["poi"]["displacement_atr"]
+        disp_dir = "bullish" if bias == "bullish" else "bearish"
+        title  = "Sweep Confirmed — Waiting for Displacement"
+        desc   = (
+            f"5M sweep of ${sw_lv:,.0f} confirmed (wick to ${sw_wk:,.0f}). "
+            f"Now need a strong {disp_dir} displacement candle (range ≥ {d_atr}×ATR) "
+            f"to prove institutional momentum is behind the move — not just a wick noise."
+        )
+        next_action = f"Watch for a large {disp_dir} candle (≥{d_atr}×ATR range) after the sweep bar."
+
+    elif stage == 4:
         choch_ref = pipe.get("choch_ref_level", 0)
         brk_dir   = "above" if bias == "bullish" else "below"
-        sw_lv     = pipe.get("sweep_level", 0)
         sw_wk     = pipe.get("sweep_wick", 0)
-        title = "Sweep Confirmed — Waiting for CHoCH"
+        title = "Displacement Confirmed — Waiting for CHoCH"
         desc  = (
-            f"The sweep of ${sw_lv:,.0f} is confirmed (wick to ${sw_wk:,.0f}). "
-            f"Now need a 5M candle to <strong>close {brk_dir} ${choch_ref:,.0f}</strong> "
-            f"— the swing level formed before the sweep. This Change of Character (CHoCH) "
-            f"confirms the structural reversal and triggers the entry."
+            f"Displacement candle confirmed. Now need a 5M candle to "
+            f"<strong>close {brk_dir} ${choch_ref:,.0f}</strong> — "
+            f"the swing level formed before the sweep. This Change of Character (CHoCH) "
+            f"confirms the structural reversal and triggers the entry signal."
         )
-        next_action = f"Watch for a 5M close {brk_dir} ${choch_ref:,.0f}. When that fires, entry at market with SL below sweep wick ${sw_wk:,.0f}."
+        next_action = f"Watch for a 5M close {brk_dir} ${choch_ref:,.0f}. Entry with SL at sweep wick ${sw_wk:,.0f}."
 
-    else:  # stage 4 = signal
+    else:  # stage 5 = signal
         sw_wk  = pipe.get("sweep_wick", price)
         buf    = CFG["risk"]["sl_buffer"]
         sl_p   = sw_wk * (1 - buf) if bias == "bullish" else sw_wk * (1 + buf)
         r_dist = abs(price - sl_p)
-        tp_p   = price + r_dist * 2 if bias == "bullish" else price - r_dist * 2
+        tc     = CFG.get("targets", {})
+        tp_r   = tc.get("fallback_r", 2.0)
+        tp_p   = price + r_dist * tp_r if bias == "bullish" else price - r_dist * tp_r
+        tp1_p  = price + r_dist if bias == "bullish" else price - r_dist
         title  = f"{'▲ LONG' if bias=='bullish' else '▼ SHORT'} SIGNAL ACTIVE"
         desc   = (
-            f"All 4 conditions met. Entry at market ~{cp}, "
-            f"SL at ${sl_p:,.0f} (below/above sweep wick ${sw_wk:,.0f}), "
-            f"TP at ${tp_p:,.0f} (2R = ${r_dist*2:,.0f} gain)."
+            f"All 5 conditions met. Entry at ~{cp}, "
+            f"SL at ${sl_p:,.0f} (sweep wick ${sw_wk:,.0f}), "
+            f"TP1 at ${tp1_p:,.0f} (1R, 50% off → SL→BE), "
+            f"TP2 at ${tp_p:,.0f} ({tp_r}R or nearest BSL/SSL pool)."
         )
         next_action = "CONFIRM token required before any order is placed (CLAUDE.md §7)."
 
-    stage_color = ["#4a5568","#d29922","#e3b341","#58a6ff","#3fb950"][min(stage,4)]
+    stage_color = ["#4a5568","#d29922","#e3b341","#58a6ff","#c97dff","#3fb950"][min(stage, 5)]
     signal_cls  = {"LONG": "sig-long", "SHORT": "sig-short"}.get(signal, "sig-flat")
     signal_txt  = {"LONG": "▲ LONG", "SHORT": "▼ SHORT", "FLAT": "— FLAT"}[signal]
 
@@ -980,4 +1057,6 @@ async def root():
 
 
 if __name__ == "__main__":
-    uvicorn.run("dashboard.server:app", host="0.0.0.0", port=8000, reload=False)
+    # Bind to localhost only. Use an SSH tunnel or nginx reverse proxy with
+    # authentication if remote access is needed — never expose raw on 0.0.0.0.
+    uvicorn.run("dashboard.server:app", host="127.0.0.1", port=8000, reload=False)

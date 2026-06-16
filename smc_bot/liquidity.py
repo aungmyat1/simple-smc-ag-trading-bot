@@ -1,13 +1,13 @@
 """
-5M liquidity sweep detection.
+5M liquidity sweep detection + post-sweep displacement gate.
 
-A sweep occurs when a bar's wick pierces a prior swing level
-and the bar CLOSES back on the opposite side — confirming the stop-hunt.
+SWEEP: a bar's wick pierces a prior swing level and closes back on the other side.
+  Long:  wick below swing low, close above it.
+  Short: wick above swing high, close below it.
 
-For a LONG setup: sweep of a prior short-term swing low.
-For a SHORT setup: sweep of a prior short-term swing high.
-
-Returns the MOST RECENT sweep in the scan window.
+DISPLACEMENT (step 9 of the workflow): after the sweep, a STRONG candle in the
+trade direction (≥ N×ATR) must appear before the CHoCH is considered valid.
+This filters out weak, low-momentum moves.
 """
 import logging
 
@@ -15,6 +15,17 @@ import numpy as np
 import pandas as pd
 
 log = logging.getLogger(__name__)
+
+
+def _atr14(df: pd.DataFrame) -> float:
+    """ATR(14) Wilder EMA — scalar for the last bar."""
+    prev = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev).abs(),
+        (df["low"]  - prev).abs(),
+    ], axis=1).max(axis=1)
+    return float(tr.ewm(span=14, adjust=False).mean().iloc[-1])
 
 
 def _swing_highs(high: np.ndarray, n: int) -> list[int]:
@@ -96,3 +107,40 @@ def get_sweep(
                     }
 
     return None
+
+
+def check_displacement(
+    df: pd.DataFrame,
+    sweep_bar: int,
+    bias: str,
+    atr_mult: float = 1.5,
+) -> bool:
+    """
+    Step 9 — verify a strong displacement candle exists after the sweep.
+
+    Looks at every bar from sweep_bar+1 to the current bar.  Returns True if
+    at least one candle:
+      • is in the trade direction (bullish body for long, bearish body for short)
+      • has range ≥ atr_mult × ATR(14)
+
+    This confirms institutional momentum drove price away from the swept level,
+    not just noise.
+    """
+    n     = len(df)
+    atr   = _atr14(df)
+    high  = df["high"].values
+    low   = df["low"].values
+    open_ = df["open"].values
+    close = df["close"].values
+
+    for i in range(sweep_bar + 1, n):
+        if (high[i] - low[i]) < atr_mult * atr:
+            continue
+        if bias == "bullish" and close[i] > open_[i]:
+            log.debug("Displacement candle at bar %d (bullish, range=%.2f, atr=%.2f)", i, high[i]-low[i], atr)
+            return True
+        if bias == "bearish" and close[i] < open_[i]:
+            log.debug("Displacement candle at bar %d (bearish, range=%.2f, atr=%.2f)", i, high[i]-low[i], atr)
+            return True
+
+    return False

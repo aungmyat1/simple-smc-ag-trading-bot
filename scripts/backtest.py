@@ -1,31 +1,32 @@
 """
-Phase-0 gate — Trial 4: smc_bot/ SMC chain on Bybit 1H+5M.
+Phase-0 gate: smc_bot/ 15-step SMC chain on Bybit 1H+5M.
 
-Signal chain (matches smc_bot/bot.py exactly):
-  structure.get_bias → poi.get_pois → price_in_poi →
-  liquidity.get_sweep → confirmation.get_choch
+Signal chain (matches smc_bot/bot.py exactly — all 15 workflow steps):
+  structure.get_bias  →  fib.fib_filter (50% discount/premium)
+  → poi.get_pois → price_in_poi
+  → liquidity.get_sweep → check_displacement
+  → confirmation.get_choch
 
 Exit model (matches smc_bot/bot.py):
-  Single TP at target_r × risk (2R default); SL = sweep wick × (1 − sl_buffer)
+  TP at targets.get_tp_level (BSL/SSL pool ≥ min_r) or fallback_r × risk.
+  SL = sweep wick × (1 ± sl_buffer).
 
 Fee model: Bybit taker 0.06%/side = 0.12% round trip (net-of-fees only).
 
 Gate: n ≥ 50 AND net PF > 1.0
 
-Config: read from smc_bot/config.yaml — same values as the live bot.
+Config: read from smc_bot/config.yaml — single source of truth.
 No imports from _archive/ in this file.
 
-Performance notes (see docs/PERFORMANCE_AUDIT.md):
-  All three O(N²) bottlenecks (liquidity._swing_lows, structure._swing_highs/lows,
-  poi._atr14) are replaced with precomputed arrays + bisect lookups in this file.
-  Signal results are mathematically identical; see docs/PERFORMANCE_PLAN.md §Signal
-  Identity Guarantee.
+Performance notes:
+  All O(N²) bottlenecks replaced with precomputed arrays + bisect lookups.
+  Signal results are mathematically identical to smc_bot/ chain.
 
 Usage:
     python3 scripts/backtest.py
     python3 scripts/backtest.py --htf data/cache/BTCUSDT_60m.parquet \\
                                 --ltf data/cache/BTCUSDT_5m.parquet \\
-                                --csv data/trial4_trades.csv
+                                --csv data/trial_trades.csv
     # profiling only (do NOT use for real trials):
     python3 scripts/backtest.py --max-bars 5000
 """
@@ -53,16 +54,19 @@ def _load_cfg() -> dict:
         return yaml.safe_load(f)
 
 _CFG      = _load_cfg()
-SYMBOL    = _CFG["exchange"]["symbol"]          # BTCUSDT
-SL_BUF    = _CFG["risk"]["sl_buffer"]          # 0.001
-TARGET_R  = _CFG["risk"]["target_r"]           # 2.0
-SWING_N   = _CFG["structure"]["swing_n"]       # 5
-OB_LB     = _CFG["poi"]["ob_lookback"]         # 50
-FVG_LB    = _CFG["poi"]["fvg_lookback"]        # 30
-DISP_ATR  = _CFG["poi"]["displacement_atr"]    # 1.5
-LIQ_SN    = _CFG["liquidity"]["swing_n"]       # 3
-LIQ_LB    = _CFG["liquidity"]["lookback"]      # 30
-CHOCH_LB  = _CFG["confirmation"]["lookback"]   # 10
+SYMBOL    = _CFG["exchange"]["symbol"]                          # BTCUSDT
+SL_BUF    = _CFG["risk"]["sl_buffer"]                          # 0.001
+TARGET_R  = _CFG["risk"]["target_r"]                           # 2.0 (fallback)
+SWING_N   = _CFG["structure"]["swing_n"]                       # 5
+OB_LB     = _CFG["poi"]["ob_lookback"]                         # 50
+FVG_LB    = _CFG["poi"]["fvg_lookback"]                        # 30
+DISP_ATR  = _CFG["poi"]["displacement_atr"]                    # 1.5 (1H OB)
+LIQ_SN    = _CFG["liquidity"]["swing_n"]                       # 3
+LIQ_LB    = _CFG["liquidity"]["lookback"]                      # 30
+DISP_ATR_LTF = _CFG["liquidity"].get("displacement_atr", 1.5) # 1.5 (5M displacement gate)
+CHOCH_LB  = _CFG["confirmation"]["lookback"]                   # 10
+FIB_LEVEL = _CFG.get("fib", {}).get("level", 0.5)             # 0.5 = 50% midpoint
+TGT_FALLBACK = _CFG.get("targets", {}).get("fallback_r", 2.0) # 2.0
 
 TAKER_FEE  = 0.0006   # Bybit taker 0.06%/side (not in config.yaml — exchange constant)
 ROUND_TRIP = TAKER_FEE * 2
@@ -78,15 +82,17 @@ _H_1H: np.ndarray
 _L_1H: np.ndarray
 _O_1H: np.ndarray
 _C_1H: np.ndarray
-_SH_1H: list[int]       # 1H swing high indices (sorted asc)
-_SL_1H: list[int]       # 1H swing low  indices (sorted asc)
-_ATR14_1H: np.ndarray   # ATR14 (Wilder EWM) for every 1H bar
+_SH_1H: list[int]        # 1H swing high indices (sorted asc)
+_SL_1H: list[int]        # 1H swing low  indices (sorted asc)
+_ATR14_1H: np.ndarray    # ATR14 (Wilder EWM) for every 1H bar
 
 _H_5M: np.ndarray
 _L_5M: np.ndarray
 _C_5M: np.ndarray
 _O_5M: np.ndarray
-_SL_5M: np.ndarray      # 5M swing low indices (sorted, int64) — bisect target
+_SL_5M: np.ndarray       # 5M swing low  indices (sorted, int64) — bisect target
+_SH_5M: np.ndarray       # 5M swing high indices (sorted, int64) — bisect target
+_ATR14_5M: np.ndarray    # ATR14 (Wilder EWM) for every 5M bar — displacement gate
 
 
 def _swing_lows_np(low: np.ndarray, n: int) -> list[int]:
@@ -122,7 +128,7 @@ def _atr14_series(df: pd.DataFrame) -> np.ndarray:
 
 def _precompute(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> None:
     global _H_1H, _L_1H, _O_1H, _C_1H, _SH_1H, _SL_1H, _ATR14_1H
-    global _H_5M, _L_5M, _C_5M, _O_5M, _SL_5M
+    global _H_5M, _L_5M, _C_5M, _O_5M, _SL_5M, _SH_5M, _ATR14_5M
 
     print("  Precomputing 1H swings + ATR14 …", flush=True)
     _H_1H = df_1h["high"].values
@@ -133,12 +139,14 @@ def _precompute(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> None:
     _SL_1H = _swing_lows_np(_L_1H, SWING_N)
     _ATR14_1H = _atr14_series(df_1h)
 
-    print("  Precomputing 5M swing lows …", flush=True)
+    print("  Precomputing 5M swings + ATR14 …", flush=True)
     _H_5M = df_5m["high"].values
     _L_5M = df_5m["low"].values
     _C_5M = df_5m["close"].values
     _O_5M = df_5m["open"].values
-    _SL_5M = np.array(_swing_lows_np(_L_5M, LIQ_SN), dtype=np.int64)
+    _SL_5M = np.array(_swing_lows_np(_L_5M,  LIQ_SN), dtype=np.int64)
+    _SH_5M = np.array(_swing_highs_np(_H_5M, LIQ_SN), dtype=np.int64)
+    _ATR14_5M = _atr14_series(df_5m)
 
 
 # ── Fast signal functions (O(1)–O(lookback) each) ────────────────────────────
@@ -251,7 +259,6 @@ def _fast_choch(sweep: dict, i: int) -> bool:
     O(CHOCH_LB) replacement for
     confirmation.get_choch(df_5m.iloc[:i+1], "bullish", sweep, CHOCH_LB).
 
-    long-only: only the bullish branch is needed (bias == "bullish" is pre-checked).
     Matches the original: sweep_bar >= n-1 → n-1 = i; last close = close[-1] = _C_5M[i].
     """
     sweep_bar = sweep["bar_idx"]
@@ -260,6 +267,82 @@ def _fast_choch(sweep: dict, i: int) -> bool:
     ref_start = max(0, sweep_bar - CHOCH_LB)
     ref_level = float(_H_5M[ref_start : sweep_bar + 1].max())
     return bool(_C_5M[i] > ref_level)
+
+
+def _fast_sweep_short(i: int) -> dict | None:
+    """
+    BSL sweep (short setup): swing high wicked above and closed back below.
+    Mirror of _fast_sweep — uses _SH_5M instead of _SL_5M.
+    """
+    n          = i + 1
+    scan_start = max(LIQ_SN * 2 + 1, n - LIQ_LB)
+    max_conf   = i - LIQ_SN
+    if max_conf < scan_start:
+        return None
+    left  = bisect.bisect_left(_SH_5M, scan_start)
+    right = bisect.bisect_right(_SH_5M, max_conf)
+    for sh_idx in _SH_5M[left:right][::-1]:   # most-recent first
+        level = _H_5M[sh_idx]
+        for k in range(int(sh_idx) + 1, n):
+            if _H_5M[k] > level and _C_5M[k] < level:
+                return {
+                    "bar_idx":      int(k),
+                    "swept_level":  float(level),
+                    "wick_extreme": float(_H_5M[k]),
+                }
+    return None
+
+
+def _fast_choch_short(sweep: dict, i: int) -> bool:
+    """CHoCH for short: close breaks below ref low after BSL sweep."""
+    sweep_bar = sweep["bar_idx"]
+    if sweep_bar >= i:
+        return False
+    ref_start = max(0, sweep_bar - CHOCH_LB)
+    ref_level = float(_L_5M[ref_start : sweep_bar + 1].min())
+    return bool(_C_5M[i] < ref_level)
+
+
+def _fast_fib_filter(htf_idx: int, price: float, bias: str) -> bool:
+    """
+    Step 3 — Fib 50% discount/premium gate (matches smc_bot/fib.py).
+
+    Computes midpoint = (last_swing_high + last_swing_low) / 2 using precomputed
+    confirmed-swing indices.  Returns True only when price is in the correct half:
+      bullish → discount (price ≤ midpoint)
+      bearish → premium  (price ≥ midpoint)
+    """
+    max_conf = htf_idx - SWING_N
+    sh_end   = bisect.bisect_right(_SH_1H, max_conf)
+    sl_end   = bisect.bisect_right(_SL_1H, max_conf)
+    if sh_end < 1 or sl_end < 1:
+        return False   # not enough swing history → skip (conservative)
+    mid = (_H_1H[_SH_1H[sh_end - 1]] + _L_1H[_SL_1H[sl_end - 1]]) / 2.0
+    if bias == "bullish":
+        return bool(price <= mid)
+    if bias == "bearish":
+        return bool(price >= mid)
+    return False
+
+
+def _fast_displacement(sweep_bar: int, i: int, bias: str) -> bool:
+    """
+    Step 9 — Post-sweep displacement gate (matches smc_bot/liquidity.check_displacement).
+
+    Scans bars in [sweep_bar+1, i] for a candle with:
+      • range ≥ DISP_ATR_LTF × ATR14_5M[i]   (strong move)
+      • body in trade direction (bullish body for long, bearish for short)
+    Uses _ATR14_5M[i] (ATR at bar i) as the reference — stable and fast.
+    """
+    atr = float(_ATR14_5M[i])
+    for k in range(sweep_bar + 1, i + 1):
+        if (_H_5M[k] - _L_5M[k]) < DISP_ATR_LTF * atr:
+            continue
+        if bias == "bullish" and _C_5M[k] > _O_5M[k]:
+            return True
+        if bias == "bearish" and _C_5M[k] < _O_5M[k]:
+            return True
+    return False
 
 
 # ── HTF alignment ─────────────────────────────────────────────────────────────
@@ -284,13 +367,29 @@ def _scan_exit(
     sl: float,
     tp: float,
 ) -> tuple[float, str, int]:
-    """First SL or TP hit from entry_bar onward. Returns (price, reason, bar)."""
+    """First SL or TP hit from entry_bar onward (long). Returns (price, reason, bar)."""
     for k in range(entry_bar, len(high)):
         if low[k] <= sl:
             return sl, "SL", k
         if high[k] >= tp:
             return tp, "TP", k
     return sl, "EOD-SL", len(high) - 1  # conservative: treat open EOD as SL
+
+
+def _scan_exit_short(
+    high: np.ndarray,
+    low:  np.ndarray,
+    entry_bar: int,
+    sl: float,
+    tp: float,
+) -> tuple[float, str, int]:
+    """First SL or TP hit from entry_bar onward (short). Returns (price, reason, bar)."""
+    for k in range(entry_bar, len(high)):
+        if high[k] >= sl:
+            return sl, "SL", k
+        if low[k] <= tp:
+            return tp, "TP", k
+    return sl, "EOD-SL", len(high) - 1
 
 
 # ── Backtest ──────────────────────────────────────────────────────────────────
@@ -321,43 +420,73 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
 
         bias, pois = _htf_cache[htf_idx]
 
-        if bias != "bullish":   # long-only per CLAUDE.md §1
+        if bias == "neutral":
             continue
 
         price = float(_C_5M[i])
 
+        # Step 3: Fib 50% discount/premium filter
+        if not _fast_fib_filter(htf_idx, price, bias):
+            continue
+
         if poi.price_in_poi(price, pois) is None:
             continue
 
-        sweep = _fast_sweep(i)
-        if sweep is None:
-            continue
+        if bias == "bullish":
+            sweep = _fast_sweep(i)
+            if sweep is None:
+                continue
+            # Step 9: displacement gate
+            if not _fast_displacement(sweep["bar_idx"], i, bias):
+                continue
+            if not _fast_choch(sweep, i):
+                continue
 
-        if not _fast_choch(sweep, i):
-            continue
+            entry_bar   = i + 1
+            entry_price = float(open_5m[entry_bar])
+            sl          = sweep["wick_extreme"] * (1.0 - SL_BUF)
+            stop_dist   = entry_price - sl
+            if stop_dist <= 0:
+                continue
+            tp = entry_price + TGT_FALLBACK * stop_dist
 
-        # Signal fires — enter at next bar open (matching bot.py live behaviour)
-        entry_bar   = i + 1
-        entry_price = float(open_5m[entry_bar])
-        sl          = sweep["wick_extreme"] * (1.0 - SL_BUF)
+            exit_price, exit_reason, exit_bar = _scan_exit(
+                high_5m, low_5m, entry_bar, sl, tp
+            )
+            gross_r = (exit_price - entry_price) / stop_dist
+            side = "long"
 
-        stop_dist = entry_price - sl
-        if stop_dist <= 0:
-            continue
+        else:  # bearish
+            sweep = _fast_sweep_short(i)
+            if sweep is None:
+                continue
+            # Step 9: displacement gate
+            if not _fast_displacement(sweep["bar_idx"], i, bias):
+                continue
+            if not _fast_choch_short(sweep, i):
+                continue
 
-        tp = entry_price + TARGET_R * stop_dist
+            entry_bar   = i + 1
+            entry_price = float(open_5m[entry_bar])
+            sl          = sweep["wick_extreme"] * (1.0 + SL_BUF)
+            stop_dist   = sl - entry_price
+            if stop_dist <= 0:
+                continue
+            tp = entry_price - TGT_FALLBACK * stop_dist
 
-        exit_price, exit_reason, exit_bar = _scan_exit(
-            high_5m, low_5m, entry_bar, sl, tp
-        )
+            exit_price, exit_reason, exit_bar = _scan_exit_short(
+                high_5m, low_5m, entry_bar, sl, tp
+            )
+            gross_r = (entry_price - exit_price) / stop_dist
+            side = "short"
 
-        gross_r = (exit_price - entry_price) / stop_dist
-        fee_r   = ROUND_TRIP * entry_price / stop_dist
-        net_r   = gross_r - fee_r
+        fee_r = ROUND_TRIP * entry_price / stop_dist
+        net_r = gross_r - fee_r
 
         trades.append({
             "entry_bar": entry_bar,
             "exit_bar":  exit_bar,
+            "side":      side,
             "ts":        str(df_5m["ts"].iloc[i]) if "ts" in df_5m.columns else i,
             "entry":     round(entry_price, 2),
             "sl":        round(sl, 2),
@@ -401,14 +530,14 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
 
 # ── Phase-C report ────────────────────────────────────────────────────────────
 
-def print_report(stats: dict, run_label: str = "Trial 4", htf_label: str = "1H", ltf_label: str = "5M") -> None:
+def print_report(stats: dict, run_label: str = "Trial X", htf_label: str = "1H", ltf_label: str = "5M") -> None:
     n, gross_pf, net_pf = stats["n"], stats["gross_pf"], stats["net_pf"]
     print("\n" + "=" * 60)
-    print(f"  SMC Bot — Phase-0 Gate  ({run_label}: smc_bot/ chain)")
+    print(f"  SMC Bot — Phase-0 Gate  ({run_label}: smc_bot/ 15-step chain)")
     print("=" * 60)
-    print(f"  Signal  : {htf_label} swing bias + OB/FVG POI → {ltf_label} sweep + CHoCH")
-    print(f"  Symbol  : {SYMBOL}  HTF={htf_label}  LTF={ltf_label}  (long-only)")
-    print(f"  Exit    : single TP={TARGET_R}R  SL=sweep-wick−{SL_BUF*100:.1f}%")
+    print(f"  Signal  : {htf_label} bias+Fib+OB/FVG → {ltf_label} sweep+disp+CHoCH")
+    print(f"  Symbol  : {SYMBOL}  HTF={htf_label}  LTF={ltf_label}  (bidirectional)")
+    print(f"  Exit    : TP={TGT_FALLBACK}R fallback  SL=sweep-wick±{SL_BUF*100:.1f}%")
     print(f"  Fee     : Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip")
     print("-" * 60)
     print(f"  Trades  : {n}")
@@ -429,10 +558,10 @@ def print_report(stats: dict, run_label: str = "Trial 4", htf_label: str = "1H",
     print("=" * 60)
 
     if verdict == "PASS":
-        print("\n  → Phase-0 cleared. Log trial 4 in VERDICT_LOG.md.")
+        print(f"\n  → Phase-0 cleared. Log {run_label} in VERDICT_LOG.md.")
         print("  → Proceed to Phase-1 paper trade (30 days, 100+ trades).")
     else:
-        print("\n  → Gate FAILED. Log trial 4. Change signal family — do not tune.")
+        print(f"\n  → Gate FAILED. Log {run_label}. Change signal family — do not tune.")
     print()
 
 
@@ -441,16 +570,18 @@ def print_report(stats: dict, run_label: str = "Trial 4", htf_label: str = "1H",
 def count_funnel(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
     """
     Count candidates surviving each AND-gated stage — diagnosis only.
-    Stages match bot.py's signal chain exactly.
+    Stages match bot.py's 15-step signal chain exactly.
     """
-    htf_map  = _align_htf(df_1h, df_5m)
+    htf_map = _align_htf(df_1h, df_5m)
 
     counts = {
-        "total_bars": 0,
-        "bias":       0,
-        "poi":        0,
-        "sweep":      0,
-        "choch":      0,
+        "total_bars":   0,
+        "bias":         0,
+        "fib":          0,
+        "poi":          0,
+        "sweep":        0,
+        "displacement": 0,
+        "choch":        0,
     }
 
     _htf_cache: dict[int, tuple] = {}
@@ -469,22 +600,31 @@ def count_funnel(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
 
         bias, pois = _htf_cache[htf_idx]
 
-        if bias != "bullish":
+        if bias == "neutral":
             continue
         counts["bias"] += 1
 
-        price  = float(_C_5M[i])
-        in_poi = any(z["low"] <= price <= z["high"] for z in pois)
-        if not in_poi:
+        price = float(_C_5M[i])
+
+        if not _fast_fib_filter(htf_idx, price, bias):
+            continue
+        counts["fib"] += 1
+
+        if not any(z["low"] <= price <= z["high"] for z in pois):
             continue
         counts["poi"] += 1
 
-        sweep = _fast_sweep(i)
+        sweep = _fast_sweep(i) if bias == "bullish" else _fast_sweep_short(i)
         if sweep is None:
             continue
         counts["sweep"] += 1
 
-        if not _fast_choch(sweep, i):
+        if not _fast_displacement(sweep["bar_idx"], i, bias):
+            continue
+        counts["displacement"] += 1
+
+        choch = _fast_choch(sweep, i) if bias == "bullish" else _fast_choch_short(sweep, i)
+        if not choch:
             continue
         counts["choch"] += 1
 
@@ -494,26 +634,28 @@ def count_funnel(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
 def print_funnel(counts: dict) -> None:
     total  = counts["total_bars"]
     stages = [
-        ("bias",   "1H swing bias bullish"),
-        ("poi",    "Price inside 1H OB/FVG"),
-        ("sweep",  "5M liquidity sweep"),
-        ("choch",  "5M CHoCH confirmed"),
+        ("bias",         "1H swing bias non-neutral"),
+        ("fib",          "Fib 50% discount/premium"),
+        ("poi",          "Price inside 1H OB/FVG"),
+        ("sweep",        "5M liquidity sweep"),
+        ("displacement", "5M displacement candle"),
+        ("choch",        "5M CHoCH confirmed"),
     ]
     print("\n" + "=" * 60)
-    print("  PHASE-D FUNNEL  (bot.py signal chain, diagnosis only)")
+    print("  PHASE-D FUNNEL  (bot.py 15-step signal chain, diagnosis only)")
     print("=" * 60)
-    print(f"  {'Stage':<30}  {'n':>6}  {'%total':>7}  {'drop':>7}")
-    print(f"  {'-'*30}  {'-'*6}  {'-'*7}  {'-'*7}")
-    print(f"  {'Total candidate bars':<30}  {total:>6}")
+    print(f"  {'Stage':<32}  {'n':>6}  {'%total':>7}  {'drop':>7}")
+    print(f"  {'-'*32}  {'-'*6}  {'-'*7}  {'-'*7}")
+    print(f"  {'Total candidate bars':<32}  {total:>6}")
     prev = total
     for key, label in stages:
         n       = counts[key]
         pct     = n / total * 100 if total else 0.0
         dropped = prev - n
-        print(f"  {label:<30}  {n:>6}  {pct:>6.1f}%  {dropped:>6} ↓")
+        print(f"  {label:<32}  {n:>6}  {pct:>6.1f}%  {dropped:>6} ↓")
         prev = n
-    print(f"  {'─'*30}")
-    print(f"  {'→ SIGNALS (= choch)':<30}  {counts['choch']:>6}")
+    print(f"  {'─'*32}")
+    print(f"  {'→ SIGNALS (= choch)':<32}  {counts['choch']:>6}")
     print("=" * 60)
     if total and counts["choch"] < 50:
         prev2 = total
@@ -586,7 +728,7 @@ def main() -> None:
 
     htf_label = _tf_label(args.htf)
     ltf_label = _tf_label(args.ltf)
-    run_label = args.run_label or "Trial 4"
+    run_label = args.run_label or "Trial X"
 
     print("Running Phase-C backtest …", flush=True)
     stats = run_backtest(df_1h, df_5m)

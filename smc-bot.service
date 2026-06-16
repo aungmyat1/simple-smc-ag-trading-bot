@@ -1,0 +1,25 @@
+[Unit]
+Description=SMC Trading Bot (BTCUSDT signal / demo execution)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aungp
+WorkingDirectory=/home/aungp/simple-smc-ag-trading-bot
+ExecStart=/home/aungp/ag-auto-trade/.venv/bin/python -m smc_bot.bot
+Restart=on-failure
+RestartSec=30
+# Give the bot 10 s to flush state on SIGTERM before SIGKILL
+TimeoutStopSec=10
+
+# Env vars are read from .env by python-dotenv — EnvironmentFile is optional
+# redundancy in case dotenv fails to load
+EnvironmentFile=-/home/aungp/simple-smc-ag-trading-bot/.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smc-bot
+
+[Install]
+WantedBy=multi-user.target

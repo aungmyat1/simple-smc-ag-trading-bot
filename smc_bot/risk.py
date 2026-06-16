@@ -8,6 +8,10 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# Bybit BTCUSDT perpetual contract minimums (kept in sync with executor.py)
+BYBIT_MIN_QTY  = 0.001
+BYBIT_QTY_STEP = 0.001
+
 
 def calc_qty(
     balance: float,
@@ -16,18 +20,42 @@ def calc_qty(
     risk_pct: float = 0.01,
 ) -> float:
     """
-    Return position size in BTC rounded to 4 decimal places.
-    Returns 0.0 if the stop distance is zero or negative.
+    Return position size in BTC, snapped to BYBIT_QTY_STEP and floored at
+    BYBIT_MIN_QTY.  Returns 0.0 if the stop distance is zero/negative.
+
+    Bybit rejects orders below BYBIT_MIN_QTY with retCode=10001, so we snap
+    up to the minimum rather than letting the caller send an invalid order.
+    The resulting risk overshoot is at most BYBIT_MIN_QTY * stop_dist, which
+    is negligible for any reasonable account size.
     """
     stop_dist = abs(entry - sl)
     if stop_dist <= 0:
         log.warning("Stop distance is zero; cannot size position")
         return 0.0
+
     risk_usdt = balance * risk_pct
-    qty = round(risk_usdt / stop_dist, 4)
+    raw_qty   = risk_usdt / stop_dist
+
+    # Snap to exchange step size
+    steps = round(raw_qty / BYBIT_QTY_STEP)
+    qty   = steps * BYBIT_QTY_STEP
+
+    if qty < BYBIT_MIN_QTY:
+        # Rounding UP to the minimum would silently breach risk_pct (the actual
+        # dollar risk could be several multiples of the intended amount on a small
+        # account).  Return 0.0 so the caller's qty <= 0 guard skips the trade.
+        log.warning(
+            "Computed qty %.4f is below exchange minimum %.3f — skipping trade "
+            "(account too small or stop too wide for this risk_pct)",
+            raw_qty, BYBIT_MIN_QTY,
+        )
+        return 0.0
+
+    qty = round(qty, 3)
+
     log.debug(
-        "Position size: balance=%.2f risk_usdt=%.2f stop_dist=%.4f qty=%.4f",
-        balance, risk_usdt, stop_dist, qty,
+        "Position size: balance=%.2f risk_usdt=%.2f stop_dist=%.4f raw=%.4f qty=%.3f",
+        balance, risk_usdt, stop_dist, raw_qty, qty,
     )
     return qty
 

@@ -4,16 +4,19 @@ SMC Bot — main loop.
 Run with:
     python -m smc_bot.bot
 
-Every 5M candle close:
-  1. Fetch balance; enforce capital-protection guards (drawdown / daily-loss / consecutive-losses)
-  2. Check if already in position — if just closed, detect win/loss and update state
-  3. Fetch 1H candles → determine bias (bullish / bearish / neutral)
-  4. Detect 1H POI zones (Order Block or FVG)
-  5. Check if current 5M price is inside a POI
-  6. Detect 5M liquidity sweep (stop-hunt of prior swing)
-  7. Detect 5M CHoCH (structural confirmation after sweep)
-  8. Size and place market order with SL=sweep wick ± buffer, TP=2R
-  9. Append trade to smc_bot_trades.csv
+Every 5M candle close (15-step workflow per CLAUDE.md §2):
+  1-2.  1H swing bias (bullish / bearish / neutral)
+  3.    Fib 50% filter — long only in discount, short only in premium
+  4.    1H OB/FVG POI zones marked
+  5.    HTF equal highs/lows identified as BSL/SSL targets
+  6.    Wait for price to tap a 1H POI zone
+  7-8.  5M liquidity sweep (stop-hunt of prior swing low/high)
+  9.    Post-sweep displacement candle confirmed (≥1.5×ATR)
+  10.   5M CHoCH (structural break confirming reversal)
+  11-12. 5M OB/FVG entry zone found; wait for price retrace into it
+  13.   SL placed at sweep wick ± buffer
+  14.   TP at nearest BSL/SSL pool (≥1.5R) or fallback 2R
+  15.   Partial plan: 50% at 1R → SL to BE → remainder at TP
 
 LIVE_TRADING=false by default — set manually in .env to enable real orders.
 Never modify LIVE_TRADING here; the owner controls it.
@@ -24,19 +27,45 @@ import csv
 import json
 import logging
 import os
+import signal
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
 
-from smc_bot import confirmation, data, executor, liquidity, poi, risk, structure
+from smc_bot import (
+    alerts, confirmation, data, executor, fib as fib_mod,
+    liquidity, poi, risk, structure, targets as tgt_mod,
+)
 
 load_dotenv()
 
-_STATE_FILE = Path("smc_bot_state.json")
+# All paths anchored to the repo root so the bot works regardless of CWD.
+_REPO_ROOT  = Path(__file__).resolve().parent.parent
+_STATE_FILE = _REPO_ROOT / "smc_bot_state.json"
+
+# Module-level state reference used by the SIGTERM handler.
+_shutdown_state: "BotState | None" = None
+
+# API failure streak counter — reset on every successful balance fetch.
+_api_fail_streak: int = 0
+_API_FAIL_THRESHOLD: int = 5
+
+
+# ── SIGTERM / SIGINT handler ────────────────────────────────────────────────────
+
+def _handle_signal(sig: int, frame) -> None:
+    _log = logging.getLogger(__name__)
+    _log.info("Signal %d received — saving state and exiting cleanly", sig)
+    if _shutdown_state is not None:
+        _shutdown_state.save()
+    alerts.send(f"SMC Bot stopped (signal {sig})")
+    sys.exit(0)
 
 
 # ── Persistent state ───────────────────────────────────────────────────────────
@@ -48,6 +77,8 @@ class BotState:
     day_start_date:     str   = ""
     consecutive_losses: int   = 0
     was_in_position:    bool  = False  # tracks position transitions for loss detection
+    open_order_id:      str   = ""     # orderId of the most recently placed order
+    entry_time:         str   = ""     # ISO UTC timestamp of the most recent entry
 
     def save(self) -> None:
         _STATE_FILE.write_text(json.dumps(asdict(self), indent=2))
@@ -55,15 +86,19 @@ class BotState:
     @classmethod
     def load(cls) -> "BotState":
         try:
-            return cls(**json.loads(_STATE_FILE.read_text()))
+            data_dict = json.loads(_STATE_FILE.read_text())
+            # Gracefully handle state files from older versions that lack new fields
+            valid = {f for f in cls.__dataclass_fields__}
+            filtered = {k: v for k, v in data_dict.items() if k in valid}
+            return cls(**filtered)
         except Exception:
             return cls()
 
     def update_day_start(self, equity: float) -> None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.day_start_date:
-            self.day_start_date    = today
-            self.day_start_equity  = equity
+            self.day_start_date   = today
+            self.day_start_equity = equity
 
     def update_peak(self, equity: float) -> None:
         if equity > self.peak_equity:
@@ -73,22 +108,29 @@ class BotState:
 # ── Logging ────────────────────────────────────────────────────────────────────
 
 def _setup_logging(log_file: str, level: str) -> None:
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    log_path = Path(log_file)
+    if not log_path.is_absolute():
+        log_path = _REPO_ROOT / log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rotating = RotatingFileHandler(
+        log_path,
+        maxBytes=10 * 1024 * 1024,   # 10 MB per file
+        backupCount=5,
+    )
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(),
-        ],
+        handlers=[rotating, logging.StreamHandler()],
         force=True,
     )
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-def _load_config(path: str = "smc_bot/config.yaml") -> dict:
-    with open(path) as f:
+def _load_config(path: str | None = None) -> dict:
+    cfg_path = Path(path) if path else _REPO_ROOT / "smc_bot" / "config.yaml"
+    with open(cfg_path) as f:
         return yaml.safe_load(f)
 
 
@@ -106,7 +148,7 @@ _SIGNAL_COLS = [
 
 
 def _append_csv(row: dict, cols: list[str], log_file: str) -> None:
-    p            = Path(log_file)
+    p = _REPO_ROOT / log_file if not Path(log_file).is_absolute() else Path(log_file)
     write_header = not p.exists()
     with open(p, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
@@ -138,6 +180,8 @@ def _sleep_to_next_candle(interval_min: int = 5) -> None:
 # ── Core cycle ─────────────────────────────────────────────────────────────────
 
 def run_cycle(cfg: dict, client, session, state: BotState) -> None:
+    global _api_fail_streak
+
     log = logging.getLogger(__name__)
     sym = cfg["exchange"]["symbol"]
     rc  = cfg["risk"]
@@ -145,24 +189,35 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     # 1. Fetch live balance; update daily-start and all-time peak
     balance = executor.get_balance(session)
     if balance <= 0:
-        log.error("Balance is 0 or unavailable; skipping cycle")
+        _api_fail_streak += 1
+        log.error(
+            "Balance is 0 or unavailable; skipping cycle (streak=%d)", _api_fail_streak
+        )
+        if _api_fail_streak >= _API_FAIL_THRESHOLD:
+            alerts.send(
+                f"⚠ SMC Bot [{sym}]: exchange API unreachable for "
+                f"{_api_fail_streak} consecutive cycles — check VPS/network"
+            )
+        state.save()
         return
 
+    _api_fail_streak = 0
     state.update_day_start(balance)
     state.update_peak(balance)
 
     # 2. Capital-protection guards — check before ANY position action
     ok, reason = risk.trading_allowed(
-        equity               = balance,
-        peak_equity          = state.peak_equity,
-        day_start_equity     = state.day_start_equity,
-        consecutive_losses   = state.consecutive_losses,
-        max_daily_loss       = rc["max_daily_loss"],
-        max_drawdown         = rc["max_drawdown"],
+        equity                 = balance,
+        peak_equity            = state.peak_equity,
+        day_start_equity       = state.day_start_equity,
+        consecutive_losses     = state.consecutive_losses,
+        max_daily_loss         = rc["max_daily_loss"],
+        max_drawdown           = rc["max_drawdown"],
         max_consecutive_losses = rc["max_consecutive_losses"],
     )
     if not ok:
         log.warning("GUARD HALT — %s", reason)
+        alerts.send(f"🔴 SMC Bot [{sym}] GUARD HALT — {reason}")
         state.save()
         return
 
@@ -171,16 +226,35 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     in_position = pos is not None
 
     if state.was_in_position and not in_position:
-        # Position just closed (Bybit hit SL or TP); query realized PnL
-        pnl = executor.get_last_closed_pnl(session, sym)
+        # Position just closed (Bybit hit SL or TP); query realized PnL.
+        # Pass entry_time so we only match the record for THIS trade and avoid
+        # stale PnL from a prior trade resetting the counter incorrectly.
+        pnl = executor.get_last_closed_pnl(session, sym, entry_time=state.entry_time)
         if pnl is not None:
             if pnl < 0:
                 state.consecutive_losses += 1
-                log.info("Trade closed at LOSS (pnl=%.4f); consecutive_losses=%d",
-                         pnl, state.consecutive_losses)
+                log.info(
+                    "Trade closed at LOSS (pnl=%.4f); consecutive_losses=%d",
+                    pnl, state.consecutive_losses,
+                )
+                alerts.send(
+                    f"📉 SMC Bot [{sym}] trade closed: LOSS pnl={pnl:.4f} "
+                    f"({state.consecutive_losses}/{rc['max_consecutive_losses']} consec)"
+                )
             else:
                 state.consecutive_losses = 0
                 log.info("Trade closed at WIN (pnl=%.4f); consecutive_losses reset", pnl)
+                alerts.send(f"📈 SMC Bot [{sym}] trade closed: WIN pnl={pnl:.4f}")
+        else:
+            # Exchange hasn't indexed the close yet; leave counter unchanged
+            # and log so the operator can investigate if this persists.
+            log.warning(
+                "Position closed but no PnL record newer than entry_time=%s — "
+                "leaving consecutive_losses=%d unchanged",
+                state.entry_time, state.consecutive_losses,
+            )
+        state.open_order_id = ""
+        state.entry_time    = ""
         state.save()
 
     state.was_in_position = in_position
@@ -201,16 +275,30 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         client, sym, cfg["exchange"]["ltf"], limit=cfg["data"]["ltf_limit"]
     )
     if df_1h.empty or df_5m.empty:
-        log.warning("Empty candle data; skipping cycle")
+        log.warning("Empty or stale candle data; skipping cycle")
         return
 
-    # 5. Bias
-    bias = structure.get_bias(df_1h, swing_n=cfg["structure"]["swing_n"])
+    # ── WORKFLOW STEP 1-2: 1H bias + swing range ─────────────────────────────
+    swing_n = cfg["structure"]["swing_n"]
+    bias = structure.get_bias(df_1h, swing_n=swing_n)
     log.info("Bias: %s", bias)
     if bias == "neutral":
         return
 
-    # 6. POI zones
+    # ── STEP 3: Fib 50% discount/premium filter ───────────────────────────────
+    # Longs: price must be in discount zone (below 50% of swing range).
+    # Shorts: price must be in premium zone (above 50% of swing range).
+    price = float(df_5m["close"].iloc[-1])
+    fib_mid = fib_mod.get_fib_midpoint(df_1h, bias, swing_n=swing_n)
+    if not fib_mod.fib_filter(price, bias, fib_mid):
+        log.info(
+            "Fib filter: price=%.2f not in %s zone (mid=%.2f)",
+            price, "discount" if bias == "bullish" else "premium",
+            fib_mid or 0,
+        )
+        return
+
+    # ── STEP 4: Mark 1H OB/FVG demand (bullish) / supply (bearish) zones ─────
     pois = poi.get_pois(
         df_1h,
         bias,
@@ -219,33 +307,49 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         displacement_atr = cfg["poi"]["displacement_atr"],
     )
     if not pois:
-        log.info("No POI zones")
+        log.info("No 1H POI zones")
         return
 
-    # 7. Price in POI?
-    price  = float(df_5m["close"].iloc[-1])
+    # ── STEP 5: Identify HTF equal lows/highs as TP target (BSL/SSL) ─────────
+    tc = cfg.get("targets", {})
+    tgt_swing_n   = cfg["structure"]["swing_n"]
+    tgt_tolerance = tc.get("equal_level_tolerance", 0.002)
+    tgt_min_r     = tc.get("min_r", 1.5)
+    tgt_fallback  = tc.get("fallback_r", 2.0)
+
+    # ── STEP 6: Wait for price to tap POI ────────────────────────────────────
     active = poi.price_in_poi(price, pois)
     if active is None:
-        log.info("Price %.2f not in any %s POI", price, bias)
+        log.info("Price %.2f not yet in any %s POI", price, bias)
         return
-    log.info("Price in %s POI [%.2f – %.2f]", active["kind"], active["low"], active["high"])
+    log.info("Price in 1H %s POI [%.2f – %.2f]", active["kind"], active["low"], active["high"])
 
-    # 8. Liquidity sweep on 5M
+    # ── STEP 7-8: 5M sweep ───────────────────────────────────────────────────
+    lc = cfg["liquidity"]
     sweep = liquidity.get_sweep(
         df_5m,
         bias,
-        lookback = cfg["liquidity"]["lookback"],
-        swing_n  = cfg["liquidity"]["swing_n"],
+        lookback = lc["lookback"],
+        swing_n  = lc["swing_n"],
     )
     if sweep is None:
-        log.info("No liquidity sweep detected")
+        log.info("No 5M liquidity sweep detected")
         return
     log.info(
         "Sweep: bar=%d level=%.2f wick=%.2f",
         sweep["bar_idx"], sweep["swept_level"], sweep["wick_extreme"],
     )
 
-    # 9. CHoCH confirmation on 5M
+    # ── STEP 9: Bullish/bearish displacement after sweep ─────────────────────
+    # A strong institutional candle (≥ N×ATR) in the trade direction must
+    # appear after the sweep bar — proves momentum, not just noise.
+    disp_atr = lc.get("displacement_atr", cfg["poi"]["displacement_atr"])
+    if not liquidity.check_displacement(df_5m, sweep["bar_idx"], bias, atr_mult=disp_atr):
+        log.info("No displacement candle after sweep (bias=%s)", bias)
+        return
+    log.info("Displacement confirmed after sweep")
+
+    # ── STEP 10: Break of minor structure (CHoCH) ─────────────────────────────
     choch = confirmation.get_choch(
         df_5m, bias, sweep, lookback=cfg["confirmation"]["lookback"]
     )
@@ -254,10 +358,33 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         return
     log.info("CHoCH confirmed (%s)", bias)
 
-    # 10. Compute order parameters
-    buf = rc["sl_buffer"]
-    r   = rc["target_r"]
+    # ── STEPS 11-12: Mark 5M OB/FVG → enter on RETRACE into that zone ────────
+    # After CHoCH, identify the 5M OB/FVG formed by the displacement candle.
+    # Only enter when price RETRACES into that zone (limit-level, not market).
+    ltf_zones = poi.get_ltf_pois(
+        df_5m, bias, sweep["bar_idx"],
+        displacement_atr = disp_atr,
+        lookback         = lc.get("ltf_poi_lookback", 15),
+    )
+    if ltf_zones:
+        ltf_entry_zone = poi.price_in_poi(price, ltf_zones)
+        if ltf_entry_zone is None:
+            log.info(
+                "CHoCH confirmed but price %.2f not yet in 5M OB/FVG — waiting for retrace",
+                price,
+            )
+            return
+        log.info(
+            "Price in 5M %s zone [%.2f – %.2f] — entry triggered",
+            ltf_entry_zone["kind"], ltf_entry_zone["low"], ltf_entry_zone["high"],
+        )
+    else:
+        # No 5M OB/FVG detected (can happen on very fast moves); enter at market.
+        ltf_entry_zone = None
+        log.info("No 5M OB/FVG found; proceeding to market entry")
 
+    # ── STEP 13: SL below/above sweep wick ───────────────────────────────────
+    buf = rc["sl_buffer"]
     if bias == "bullish":
         sl   = sweep["wick_extreme"] * (1.0 - buf)
         side = "Buy"
@@ -266,9 +393,27 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         side = "Sell"
 
     stop_dist = abs(price - sl)
-    tp        = price + r * stop_dist if side == "Buy" else price - r * stop_dist
-    qty       = risk.calc_qty(balance, price, sl, rc["risk_pct"])
+    if stop_dist <= 0:
+        log.warning("stop_dist=0; skipping")
+        return
 
+    # ── STEP 14: TP at previous highs/lows (BSL/SSL) with 2R fallback ────────
+    # Prefer the nearest equal-highs cluster (longs) / equal-lows cluster (shorts)
+    # that gives ≥ min_r reward.  Fall back to fixed fallback_r if none found.
+    tp = tgt_mod.get_tp_level(
+        df_1h, bias, price, stop_dist,
+        swing_n   = tgt_swing_n,
+        tolerance = tgt_tolerance,
+        min_r     = tgt_min_r,
+    )
+    if tp is None:
+        tp = price + tgt_fallback * stop_dist if side == "Buy" else price - tgt_fallback * stop_dist
+        log.info("No BSL/SSL TP found — using %.1fR fallback: %.2f", tgt_fallback, tp)
+    else:
+        achieved_r = abs(tp - price) / stop_dist
+        log.info("TP at liquidity pool %.2f (%.2fR)", tp, achieved_r)
+
+    qty = risk.calc_qty(balance, price, sl, rc["risk_pct"])
     if qty <= 0:
         log.warning("qty=0; skipping (stop distance too small?)")
         return
@@ -277,11 +422,21 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     mode        = "SIGNAL_ONLY" if signal_only else "EXECUTE"
 
     log.info(
-        "[%s] %s | entry=%.2f SL=%.2f TP=%.2f (%.1fR) qty=%s",
-        mode, side, price, sl, tp, r, qty,
+        "[%s] %s | entry=%.2f SL=%.2f TP=%.2f R=%.2f qty=%s",
+        mode, side, price, sl, tp, abs(tp - price) / stop_dist, qty,
     )
 
-    # 11. Always log the signal (even in signal-only mode)
+    # ── STEP 15: Partial exit plan (logged; live execution deferred) ──────────
+    pc = cfg.get("partials", {})
+    tp1_r   = pc.get("tp1_r", 1.0)
+    tp1_pct = pc.get("tp1_pct", 0.50)
+    tp1_price = price + tp1_r * stop_dist if side == "Buy" else price - tp1_r * stop_dist
+    log.info(
+        "Partial plan: TP1 %.0f%% @ %.2f (1R=%.2fR), TP2 @ %.2f (BSL/SSL), SL→BE after TP1",
+        tp1_pct * 100, tp1_price, tp1_r, tp,
+    )
+
+    # ── Signal log (always written) ───────────────────────────────────────────
     _log_signal({
         "timestamp":   datetime.now(timezone.utc).isoformat(),
         "symbol":      sym,
@@ -298,36 +453,55 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         "mode":        mode,
     })
 
-    # 12. Execute only when signal_only_mode is off
     if signal_only:
-        log.info("SIGNAL_ONLY — order NOT placed. Flip signal_only_mode: false to enable.")
+        alerts.send(
+            f"📊 SMC Bot [{sym}] SIGNAL {side} | entry={price:.0f} "
+            f"SL={sl:.0f} TP1={tp1_price:.0f} TP={tp:.0f} qty={qty} (SIGNAL_ONLY)"
+        )
         return
 
-    result = executor.place_order(session, sym, side, qty, sl, tp)
+    result     = executor.place_order(session, sym, side, qty, sl, tp)
+    order_id   = result.get("orderId", "")
+    entry_time = datetime.now(timezone.utc).isoformat()
 
     _log_trade({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": entry_time,
         "symbol":    sym,
         "side":      side,
         "entry":     round(price, 2),
         "stop":      round(sl, 2),
         "target":    round(tp, 2),
         "qty":       qty,
-        "order_id":  result.get("orderId", ""),
+        "order_id":  order_id,
         "poi_kind":  active["kind"],
         "bias":      bias,
     })
-    log.info("Trade logged")
+
+    state.open_order_id   = order_id
+    state.entry_time      = entry_time
     state.was_in_position = True
     state.save()
+
+    log.info("Trade logged — orderId=%s", order_id)
+    alerts.send(
+        f"✅ SMC Bot [{sym}] ORDER {side} | entry={price:.0f} "
+        f"SL={sl:.0f} TP={tp:.0f} qty={qty} orderId={order_id}"
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global _shutdown_state
+
     cfg = _load_config()
     _setup_logging(cfg["logging"]["file"], cfg["logging"]["level"])
     log = logging.getLogger(__name__)
+
+    # Install signal handlers before anything else so a fast SIGTERM during
+    # startup doesn't leave the process in a partially-initialised state.
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT,  _handle_signal)
 
     api_key    = os.getenv("BYBIT_DEMO_API_KEY", os.getenv("BYBIT_API_KEY", ""))
     api_secret = os.getenv("BYBIT_DEMO_API_SECRET", os.getenv("BYBIT_API_SECRET", ""))
@@ -337,11 +511,18 @@ def main() -> None:
     client      = data.make_client(testnet=False)
     session     = executor.make_session(api_key, api_secret, demo=demo)
     state       = BotState.load()
+    _shutdown_state = state           # make accessible to SIGTERM handler
+
     signal_only = cfg.get("signal_only_mode", True)
 
     log.info(
-        "SMC Bot started — %s %s/%s demo=%s live=%s mode=%s | "
-        "state: peak=%.2f day_start=%.2f consec_losses=%d",
+        "SMC Bot started — state_file=%s config=%s",
+        _STATE_FILE,
+        _REPO_ROOT / "smc_bot" / "config.yaml",
+    )
+    log.info(
+        "%s %s/%s demo=%s live=%s mode=%s | "
+        "state: peak=%.2f day_start=%.2f consec_losses=%d open_order=%s",
         cfg["exchange"]["symbol"],
         cfg["exchange"]["htf"],
         cfg["exchange"]["ltf"],
@@ -351,16 +532,19 @@ def main() -> None:
         state.peak_equity,
         state.day_start_equity,
         state.consecutive_losses,
+        state.open_order_id or "none",
+    )
+    alerts.send(
+        f"🟢 SMC Bot started — {cfg['exchange']['symbol']} "
+        f"{'SIGNAL_ONLY' if signal_only else 'EXECUTE'} mode"
     )
 
     while True:
         try:
             run_cycle(cfg, client, session, state)
-        except KeyboardInterrupt:
-            log.info("Stopped by user")
-            break
         except Exception as exc:
             log.exception("Cycle error: %s", exc)
+            alerts.send(f"⚠ SMC Bot [{cfg['exchange']['symbol']}] cycle error: {exc}")
 
         _sleep_to_next_candle(interval_min=5)
 

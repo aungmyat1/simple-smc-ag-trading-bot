@@ -109,3 +109,69 @@ def price_in_poi(price: float, zones: list[dict]) -> dict | None:
         if z["low"] <= price <= z["high"]:
             return z
     return None
+
+
+def get_ltf_pois(
+    df: pd.DataFrame,
+    bias: str,
+    start_bar: int,
+    displacement_atr: float = 1.5,
+    lookback: int = 15,
+) -> list[dict]:
+    """
+    Steps 11-12 — detect the 5M OB/FVG created by the displacement move.
+
+    Scans bars from start_bar (sweep bar) onward — the displacement and
+    pullback zone are all to the RIGHT of the sweep.
+
+    For a bullish setup:
+      OB = last bearish candle before a bullish displacement ≥ N×ATR in this window.
+      FVG = gap where high[i-2] < low[i] (upward gap filled on retrace).
+
+    These zones define the ideal limit-entry area after the CHoCH fires.
+    """
+    zones: list[dict] = []
+    n      = len(df)
+    atr    = _atr14(df)
+    scan_s = max(start_bar, 0)
+    scan_e = min(n, start_bar + lookback)
+
+    high   = df["high"].values
+    low    = df["low"].values
+    open_  = df["open"].values
+    close  = df["close"].values
+
+    if bias == "bullish":
+        for j in range(scan_s, scan_e - 1):
+            if close[j] >= open_[j]:
+                continue
+            j1 = j + 1
+            if (
+                close[j1] > open_[j1]
+                and (high[j1] - low[j1]) >= displacement_atr * atr
+            ):
+                zones.append({"kind": "OB", "low": float(min(open_[j], close[j])),
+                               "high": float(max(open_[j], close[j]))})
+        for i in range(max(scan_s + 2, 2), scan_e):
+            fvg_lo, fvg_hi = float(high[i - 2]), float(low[i])
+            if fvg_hi > fvg_lo:
+                zones.append({"kind": "FVG", "low": fvg_lo, "high": fvg_hi})
+
+    elif bias == "bearish":
+        for j in range(scan_s, scan_e - 1):
+            if close[j] <= open_[j]:
+                continue
+            j1 = j + 1
+            if (
+                close[j1] < open_[j1]
+                and (high[j1] - low[j1]) >= displacement_atr * atr
+            ):
+                zones.append({"kind": "OB", "low": float(min(open_[j], close[j])),
+                               "high": float(max(open_[j], close[j]))})
+        for i in range(max(scan_s + 2, 2), scan_e):
+            fvg_hi, fvg_lo = float(low[i - 2]), float(high[i])
+            if fvg_hi > fvg_lo:
+                zones.append({"kind": "FVG", "low": fvg_lo, "high": fvg_hi})
+
+    log.debug("LTF POI zones (bias=%s, start=%d): %d found", bias, start_bar, len(zones))
+    return zones
