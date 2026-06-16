@@ -775,7 +775,266 @@ a:hover { text-decoration: underline; }
 .pos-flat  { background:var(--bg3); color:var(--muted); border:1px solid var(--border); }
 
 .full-width { grid-column:1 / -1; }
+
+/* ── SMC Checklist ─────────────────────────────────────────────────────────── */
+.cl-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.cl-card { background:var(--bg3); border:1px solid var(--border); border-radius:8px; padding:12px 14px; break-inside:avoid; }
+.cl-card.full { grid-column:1/-1; }
+.cl-h2 { font-size:11px; font-weight:700; letter-spacing:.10em; text-transform:uppercase;
+         color:var(--blue); margin:0 0 9px; padding-bottom:6px; border-bottom:1px solid var(--border); }
+.cl-h3 { font-size:11px; font-weight:700; color:var(--orange); margin:8px 0 5px; }
+.cl-item { display:flex; gap:8px; align-items:flex-start; margin:5px 0; font-size:12px; line-height:1.4; }
+.cl-box  { appearance:none; -webkit-appearance:none; width:15px; height:15px; flex:0 0 15px; margin-top:1px;
+           border:1.5px solid #3d4a5a; border-radius:3px; background:var(--bg2); cursor:pointer; position:relative; }
+.cl-box:checked { background:var(--green); border-color:var(--green); }
+.cl-box:checked::after { content:"✓"; position:absolute; top:-1px; left:1px; font-size:11px; color:#000; font-weight:900; }
+.cl-note { background:var(--bg2); border-left:3px solid var(--blue); padding:7px 10px; font-size:11px;
+           color:var(--muted); border-radius:4px; margin-top:8px; }
+.cl-table { width:100%; border-collapse:collapse; font-size:11.5px; margin-top:6px; }
+.cl-table th { background:var(--bg2); padding:5px 7px; color:var(--muted); font-weight:600;
+               font-size:10px; letter-spacing:.06em; text-transform:uppercase; border-bottom:1px solid var(--border); }
+.cl-table td { padding:5px 7px; border-bottom:1px solid var(--bg); font-size:11.5px; }
+.cl-table tr:last-child td { border-bottom:none; }
+.grade-bar { display:flex; gap:8px; margin-bottom:10px; }
+.grade-box { flex:1; text-align:center; padding:8px 4px; border-radius:6px; border:2px solid transparent;
+             font-size:13px; font-weight:700; letter-spacing:.06em; transition:all .2s; }
+.grade-A { background:#1a3a1a; color:var(--green); border-color:#2a5a2a; }
+.grade-B { background:#2a2010; color:var(--orange); border-color:#4a3820; }
+.grade-C { background:#3a1a1a; color:var(--red); border-color:#6b2020; }
+.grade-inactive { background:var(--bg2); color:var(--muted); border-color:var(--border); opacity:.4; }
+.cl-reset { font-size:10px; color:var(--muted); border:1px solid var(--border); border-radius:4px;
+            padding:2px 8px; cursor:pointer; background:transparent; float:right; margin-top:-2px; }
+.cl-reset:hover { color:var(--text); border-color:#6e7681; }
+.cl-progress { height:4px; background:var(--bg2); border-radius:2px; margin-bottom:10px; overflow:hidden; }
+.cl-progress-bar { height:100%; background:var(--green); border-radius:2px; transition:width .3s; }
 """
+
+
+# ── SMC Checklist panel ────────────────────────────────────────────────────────
+
+def _checklist_html() -> str:
+    """
+    Interactive SMC Trading Checklist.
+    State is stored in localStorage so checks survive the 30s auto-refresh.
+    Grade is computed live in JS: A = all critical boxes (§1–§5) checked,
+    B = partial, C = missing critical items.
+    """
+    def item(cid: str, text: str) -> str:
+        return (f'<div class="cl-item">'
+                f'<input type="checkbox" class="cl-box" id="{cid}" onchange="clSave(this)">'
+                f'<label for="{cid}">{text}</label></div>')
+
+    def note(text: str) -> str:
+        return f'<div class="cl-note">{text}</div>'
+
+    s1 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">1 · Hard Filter: Market Context</div>
+      {item("c1a","Start on <strong>1H or 4H</strong>. Structure first, entry second.")}
+      {item("c1b","Bias is clear: trending or a confirmed CHoCH has shifted bias.")}
+      {item("c1c","External swing high/low is identified.")}
+      {item("c1d","Not trading random internal chop.")}
+      {note("If structure is unclear, there is no trade.")}
+    </div>"""
+
+    s2 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">2 · Premium / Discount Filter</div>
+      {item("c2a","Dealing range drawn from relevant external swing low → high.")}
+      {item("c2b","<strong>Buy only in discount</strong> (below 50% of range).")}
+      {item("c2c","<strong>Sell only in premium</strong> (above 50% of range).")}
+      {item("c2d","Not buying high or selling low in the middle of the range.")}
+    </div>"""
+
+    s3 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">3 · Valid HTF POI</div>
+      <div class="cl-h3">Order Block</div>
+      {item("c3a","OB aligns with a meaningful <strong>BOS or CHoCH</strong>.")}
+      {item("c3b","The move away showed <strong>displacement</strong> / urgency.")}
+      {item("c3c","OB is still <strong>fresh / unmitigated</strong>.")}
+      {item("c3d","Extra confluence: nearby liquidity and/or FVG.")}
+      <div class="cl-h3">Fair Value Gap</div>
+      {item("c3e","FVG formed from a move that caused an external BOS or CHoCH.")}
+      {item("c3f","FVG is with trend or with a confirmed reversal.")}
+      {item("c3g","FVG is still unmitigated.")}
+    </div>"""
+
+    s4 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">4 · Liquidity Story</div>
+      {item("c4a","Liquidity marked: equal highs/lows, prior session H/L, swing points.")}
+      {item("c4b","Know what price is likely to sweep <strong>before</strong> the move.")}
+      {item("c4c","Know what liquidity I am targeting <strong>after</strong> entry.")}
+      {item("c4d","Target pool is large enough to justify the risk.")}
+    </div>"""
+
+    s5 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">5 · LTF Confirmation</div>
+      {item("c5a","Price reached the HTF POI first.")}
+      {item("c5b","A <strong>liquidity sweep</strong> occurred inside/just before the zone.")}
+      {item("c5c","A valid <strong>5M CHoCH / MSS / BOS</strong> formed after the sweep.")}
+      {item("c5d","Displacement leg created a new 5M OB and/or FVG.")}
+      {item("c5e","Waiting for retrace into execution zone, not chasing the impulse.")}
+    </div>"""
+
+    s6 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">6 · Entry Model</div>
+      <table class="cl-table">
+        <tr><th>Type</th><th>When</th><th>Entry</th></tr>
+        <tr><td><strong>Confirmation</strong></td><td>Default model</td><td>Retrace into 5M OB/FVG after sweep + CHoCH</td></tr>
+        <tr><td>Refined</td><td>Very clean setup</td><td>50% of impulse / OB midpoint / FVG midpoint</td></tr>
+        <tr><td>Aggressive</td><td>Exceptional confluence only</td><td>Direct touch of HTF POI with defined SL</td></tr>
+      </table>
+      {item("c6a","Default choice: Confirmation. Aggressive only if confluence is exceptional.")}
+    </div>"""
+
+    s7 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">7 · Stop Loss Rules</div>
+      {item("c7a","SL goes <strong>beyond invalidation</strong>, not a random tight distance.")}
+      {item("c7b","Buy: SL below sweep low or below OB/FVG invalidation.")}
+      {item("c7c","Sell: SL above sweep high or above OB/FVG invalidation.")}
+      {item("c7d","If stop is too wide, reduce size or skip the trade.")}
+    </div>"""
+
+    s8 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">8 · Take Profit Rules</div>
+      {item("c8a","TP1 = nearest internal liquidity / first logical reaction point.")}
+      {item("c8b","TP2 = structural high/low or external liquidity (BSL/SSL).")}
+      {item("c8c","Exit plan is defined <strong>before</strong> entry.")}
+      {item("c8d","Minimum R:R acceptable for setup type (Confirmation ≥ 1:2).")}
+    </div>"""
+
+    s9 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">9 · Session / Timing</div>
+      {item("c9a","Prefer high-volume windows: <strong>London</strong> and <strong>New York</strong>.")}
+      {item("c9b","Not forcing entries in low-volume chop or right into major news.")}
+      {item("c9c","For BTC: active session is London open + NY session (08:00–21:00 UTC).")}
+    </div>"""
+
+    s10 = f"""
+    <div class="cl-card">
+      <div class="cl-h2">10 · Auto No-Trade Conditions</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
+        <div>
+          {item("c10a","No clear HTF bias.")}
+          {item("c10b","POI already mitigated.")}
+          {item("c10c","FVG did not cause external BOS/CHoCH.")}
+          {item("c10d","OB has no displacement / no intent.")}
+        </div>
+        <div>
+          {item("c10e","No 5M sweep.")}
+          {item("c10f","No lower-timeframe structural shift.")}
+          {item("c10g","R:R below minimum plan.")}
+          {item("c10h","Trade is driven by FOMO.")}
+        </div>
+      </div>
+    </div>"""
+
+    grade_section = """
+    <div class="cl-card full">
+      <div class="cl-h2" style="display:flex;justify-content:space-between;align-items:center">
+        Final Grade
+        <button class="cl-reset" onclick="clReset()">Reset all</button>
+      </div>
+      <div class="cl-progress"><div class="cl-progress-bar" id="clProg" style="width:0%"></div></div>
+      <div class="grade-bar">
+        <div class="grade-box grade-inactive" id="grA">A SETUP</div>
+        <div class="grade-box grade-inactive" id="grB">B SETUP</div>
+        <div class="grade-box grade-inactive" id="grC">C SETUP</div>
+      </div>
+      <table class="cl-table">
+        <tr><th>Grade</th><th>Requirements</th><th>Action</th></tr>
+        <tr><td style="color:var(--green);font-weight:700">A</td>
+            <td>Clear HTF bias + discount/premium + fresh POI + sweep + LTF confirmation + clean R:R</td>
+            <td style="color:var(--green)">Take normal risk</td></tr>
+        <tr><td style="color:var(--orange);font-weight:700">B</td>
+            <td>One non-critical weakness but structure still clean</td>
+            <td style="color:var(--orange)">Reduce size or be selective</td></tr>
+        <tr><td style="color:var(--red);font-weight:700">C</td>
+            <td>Missing structure, confirmation, or clean target</td>
+            <td style="color:var(--red)">No trade</td></tr>
+      </table>
+    </div>"""
+
+    # Critical checkboxes (must all be checked for A grade)
+    critical = ["c1a","c1b","c1c","c2b","c2c","c3a","c3b","c3c","c4a","c4b","c4c",
+                "c5a","c5b","c5c","c5e","c7a","c8a","c8b","c8c"]
+    critical_js = str(critical).replace("'", '"')
+
+    js = f"""
+    <script>
+    const CL_KEY = 'smc_checklist_v1';
+    const CRITICAL = {critical_js};
+    const ALL_IDS = ["c1a","c1b","c1c","c1d","c2a","c2b","c2c","c2d",
+      "c3a","c3b","c3c","c3d","c3e","c3f","c3g","c4a","c4b","c4c","c4d",
+      "c5a","c5b","c5c","c5d","c5e","c6a","c7a","c7b","c7c","c7d",
+      "c8a","c8b","c8c","c8d","c9a","c9b","c9c",
+      "c10a","c10b","c10c","c10d","c10e","c10f","c10g","c10h"];
+
+    function clLoad() {{
+      const saved = JSON.parse(localStorage.getItem(CL_KEY) || '{{}}');
+      ALL_IDS.forEach(id => {{
+        const el = document.getElementById(id);
+        if (el) el.checked = !!saved[id];
+      }});
+      clGrade();
+    }}
+    function clSave(el) {{
+      const saved = JSON.parse(localStorage.getItem(CL_KEY) || '{{}}');
+      saved[el.id] = el.checked;
+      localStorage.setItem(CL_KEY, JSON.stringify(saved));
+      clGrade();
+    }}
+    function clReset() {{
+      localStorage.removeItem(CL_KEY);
+      ALL_IDS.forEach(id => {{ const el = document.getElementById(id); if (el) el.checked = false; }});
+      clGrade();
+    }}
+    function clGrade() {{
+      const checked = new Set(ALL_IDS.filter(id => {{ const el = document.getElementById(id); return el && el.checked; }}));
+      const total = ALL_IDS.length;
+      const done  = checked.size;
+      const pct   = total ? Math.round(done / total * 100) : 0;
+      const prog  = document.getElementById('clProg');
+      if (prog) prog.style.width = pct + '%';
+
+      const critDone   = CRITICAL.every(id => checked.has(id));
+      const noTradeFail= ["c10a","c10b","c10c","c10d","c10e","c10f"].some(id => checked.has(id));
+      const fomoFail   = checked.has("c10h");
+
+      let grade = 'C';
+      if (noTradeFail || fomoFail) {{
+        grade = 'C';
+      }} else if (critDone && done >= Math.round(total * 0.80)) {{
+        grade = 'A';
+      }} else if (done >= Math.round(total * 0.50)) {{
+        grade = 'B';
+      }}
+
+      ['grA','grB','grC'].forEach(id => {{
+        const el = document.getElementById(id);
+        if (!el) return;
+        const letter = id.replace('gr','');
+        el.className = 'grade-box ' + (grade === letter ? 'grade-' + letter : 'grade-inactive');
+      }});
+    }}
+    document.addEventListener('DOMContentLoaded', clLoad);
+    </script>"""
+
+    return f"""
+    <div class="card full-width">
+      <div class="card-title">SMC Trading Checklist — Pre-Trade Quality Gate</div>
+      <div class="cl-grid">
+        {s1}{s2}{s3}{s4}{s5}{s6}{s7}{s8}{s9}{s10}{grade_section}
+      </div>
+      {js}
+    </div>"""
 
 
 # ── HTML builder ───────────────────────────────────────────────────────────────
@@ -865,24 +1124,33 @@ def _build_html(
 
     # Pipeline gate card (compact — full story is in proximity panel)
     if pipe.get("ok"):
-        bias     = pipe["bias"]
-        bias_cls = {"bullish": "gate-pass", "bearish": "gate-fail"}.get(bias, "gate-wait")
-        bias_icon= {"bullish": "✅", "bearish": "🔻"}.get(bias, "⬜")
-        poi_cls  = "gate-pass" if pipe["in_poi"] else "gate-fail"
-        poi_lbl  = f'in {pipe["poi_kind"]} zone' if pipe["in_poi"] else f'{pipe["poi_count"]} zones · not reached'
-        sw_cls   = "gate-pass" if pipe["sweep"] else "gate-wait"
-        sw_lbl   = f'swept ${pipe["sweep_level"]:,.0f}' if pipe["sweep"] else "none"
-        ch_cls   = "gate-pass" if pipe["choch"] else "gate-wait"
-        ch_lbl   = "confirmed" if pipe["choch"] else ("break ${:,.0f}".format(pipe["choch_ref_level"]) if pipe.get("choch_ref_level") else "—")
-        sig      = pipe["signal"]
-        sig_cls  = {"LONG":"sig-long","SHORT":"sig-short"}.get(sig,"sig-flat")
+        bias      = pipe["bias"]
+        bias_cls  = {"bullish": "gate-pass", "bearish": "gate-fail"}.get(bias, "gate-wait")
+        bias_icon = {"bullish": "✅", "bearish": "🔻"}.get(bias, "⬜")
+        fib_ok    = pipe.get("fib_ok", False)
+        fib_mid   = pipe.get("fib_mid")
+        fib_lbl   = f'{"discount" if bias=="bullish" else "premium"} (mid ${fib_mid:,.0f})' if fib_mid else "—"
+        fib_cls   = "gate-pass" if fib_ok else "gate-wait"
+        poi_cls   = "gate-pass" if pipe["in_poi"] else "gate-wait"
+        poi_lbl   = f'in {pipe["poi_kind"]} zone' if pipe["in_poi"] else f'{pipe["poi_count"]} zones · not reached'
+        sw_cls    = "gate-pass" if pipe["sweep"] else "gate-wait"
+        sw_lbl    = f'swept ${pipe["sweep_level"]:,.0f}' if pipe["sweep"] else "none"
+        disp_ok   = pipe.get("displacement", False)
+        disp_cls  = "gate-pass" if disp_ok else "gate-wait"
+        disp_lbl  = "confirmed" if disp_ok else ("pending" if pipe["sweep"] else "—")
+        ch_cls    = "gate-pass" if pipe["choch"] else "gate-wait"
+        ch_lbl    = "confirmed" if pipe["choch"] else ("break ${:,.0f}".format(pipe["choch_ref_level"]) if pipe.get("choch_ref_level") else "—")
+        sig       = pipe["signal"]
+        sig_cls   = {"LONG":"sig-long","SHORT":"sig-short"}.get(sig,"sig-flat")
 
         pipe_html = f"""
         <div class="card">
           <div class="card-title">Signal Gates · BTC {_fmt_price(pipe['price'])}</div>
           {_gate_row(bias_icon, "1H Bias", bias.upper(), bias_cls)}
+          {_gate_row("✅" if fib_ok else "⬜", "Fib Zone", fib_lbl, fib_cls)}
           {_gate_row("✅" if pipe['in_poi'] else "⬜", "1H POI", poi_lbl, poi_cls)}
           {_gate_row("✅" if pipe['sweep'] else "⬜", "5M Sweep", sw_lbl, sw_cls)}
+          {_gate_row("✅" if disp_ok else "⬜", "Displacement", disp_lbl, disp_cls)}
           {_gate_row("✅" if pipe['choch'] else "⬜", "5M CHoCH", ch_lbl, ch_cls)}
           <div style="text-align:center;margin-top:12px">
             <span class="signal-badge {sig_cls}">{"▲ " if sig=="LONG" else "▼ " if sig=="SHORT" else ""}{sig}</span>
@@ -958,6 +1226,9 @@ def _build_html(
           <div style="text-align:center;padding:18px;color:var(--muted)">No trades recorded yet.</div>
         </div>"""
 
+    # SMC Checklist
+    checklist_html = _checklist_html()
+
     # Log
     def _lcls(ln):
         l = ln.lower()
@@ -990,6 +1261,7 @@ def _build_html(
   <div class="grid-2" style="margin-bottom:12px">{proximity_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{st_html}{links_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{trades_html}</div>
+  <div class="grid-2" style="margin-bottom:12px">{checklist_html}</div>
   <div class="grid-2">{log_html}</div>
   <script>const lb=document.getElementById('lb');if(lb)lb.scrollTop=lb.scrollHeight;</script>
 </body>
