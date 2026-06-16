@@ -141,10 +141,33 @@ _TRADE_COLS = [
     "qty", "order_id", "poi_kind", "bias",
 ]
 
-_SIGNAL_COLS = [
-    "timestamp", "symbol", "bias", "poi_kind", "poi_low", "poi_high",
-    "sweep_level", "choch", "entry", "stop", "target", "qty", "mode",
+_JOURNAL_COLS = [
+    "Date", "Trade ID", "Pair", "Day", "Session", "Kill Zone",
+    "Direction", "HTF Bias", "HTF POI Type", "Premium/Discount",
+    "Sweep Direction", "Liquidity Sweep", "5M MSS/BOS", "MSS Strength",
+    "Entry Type", "Entry TF", "Entry Price", "Stop Loss", "TP1", "TP2",
+    "Risk (pips)", "Reward TP1 (pips)", "Reward TP2 (pips)",
+    "Planned RR TP1", "Planned RR TP2",
+    "MAE", "MFE", "Result", "Actual R Multiple",
+    "News Nearby", "Confluence Score (1-5)", "Rule Compliance",
+    "Screenshot Before", "Screenshot After", "Notes",
 ]
+
+
+def _session_and_killzone(dt: datetime) -> tuple[str, str]:
+    """Map a UTC datetime to a trading session and kill zone label."""
+    total = dt.hour * 60 + dt.minute
+    if 480 <= total < 570:    # 08:00–09:30
+        return "London", "London Open"
+    if 570 <= total < 720:    # 09:30–12:00
+        return "London", "London AM"
+    if 720 <= total < 780:    # 12:00–13:00
+        return "Overlap", "London/NY Overlap"
+    if 780 <= total < 870:    # 13:00–14:30
+        return "New York", "NY Open"
+    if 870 <= total < 1260:   # 14:30–21:00
+        return "New York", "NY PM"
+    return "Asia", "Asia"
 
 
 def _append_csv(row: dict, cols: list[str], log_file: str) -> None:
@@ -162,7 +185,7 @@ def _log_trade(row: dict, log_file: str = "smc_bot_trades.csv") -> None:
 
 
 def _log_signal(row: dict, log_file: str = "smc_bot_signals.csv") -> None:
-    _append_csv(row, _SIGNAL_COLS, log_file)
+    _append_csv(row, _JOURNAL_COLS, log_file)
 
 
 # ── Timing ─────────────────────────────────────────────────────────────────────
@@ -306,8 +329,16 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         fvg_lookback     = cfg["poi"]["fvg_lookback"],
         displacement_atr = cfg["poi"]["displacement_atr"],
     )
+    # Trial 6: exclude zones already mitigated (price through ≥50% of zone)
+    raw_count = len(pois)
+    pois = poi.filter_fresh_zones(pois, df_1h, bias)
+    if len(pois) < raw_count:
+        log.info(
+            "Mitigation filter: %d/%d 1H zones rejected (bias=%s)",
+            raw_count - len(pois), raw_count, bias,
+        )
     if not pois:
-        log.info("No 1H POI zones")
+        log.info("No fresh 1H POI zones after mitigation filter")
         return
 
     # ── STEP 5: Identify HTF equal lows/highs as TP target (BSL/SSL) ─────────
@@ -347,7 +378,8 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     if not liquidity.check_displacement(df_5m, sweep["bar_idx"], bias, atr_mult=disp_atr):
         log.info("No displacement candle after sweep (bias=%s)", bias)
         return
-    log.info("Displacement confirmed after sweep")
+    mss_strength = liquidity.displacement_strength(df_5m, sweep["bar_idx"], bias)
+    log.info("Displacement confirmed after sweep (%s)", mss_strength)
 
     # ── STEP 10: Break of minor structure (CHoCH) ─────────────────────────────
     choch = confirmation.get_choch(
@@ -436,21 +468,56 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         tp1_pct * 100, tp1_price, tp1_r, tp,
     )
 
-    # ── Signal log (always written) ───────────────────────────────────────────
+    # ── Signal log / trade journal (always written) ───────────────────────────
+    now       = datetime.now(timezone.utc)
+    session, kill_zone = _session_and_killzone(now)
+    trade_id  = f"{now.strftime('%Y%m%d')}_{sym}_{now.strftime('%H%M%S')}"
+    poi_label = f"1H {bias.capitalize()} {'Order Block' if active['kind'] == 'OB' else 'FVG'}"
+    entry_type = (
+        f"{'OB' if ltf_entry_zone['kind'] == 'OB' else 'FVG'} Retest"
+        if ltf_entry_zone else "Market"
+    )
+    risk_pts      = round(abs(price - sl), 2)
+    reward_tp1    = round(abs(tp1_price - price), 2)
+    reward_tp2    = round(abs(tp - price), 2)
+    planned_rr_tp2 = round(abs(tp - price) / stop_dist, 2) if stop_dist else ""
+
     _log_signal({
-        "timestamp":   datetime.now(timezone.utc).isoformat(),
-        "symbol":      sym,
-        "bias":        bias,
-        "poi_kind":    active["kind"],
-        "poi_low":     round(active["low"], 2),
-        "poi_high":    round(active["high"], 2),
-        "sweep_level": round(sweep["swept_level"], 2),
-        "choch":       True,
-        "entry":       round(price, 2),
-        "stop":        round(sl, 2),
-        "target":      round(tp, 2),
-        "qty":         qty,
-        "mode":        mode,
+        "Date":                   now.strftime("%Y-%m-%d"),
+        "Trade ID":               trade_id,
+        "Pair":                   sym,
+        "Day":                    now.strftime("%A"),
+        "Session":                session,
+        "Kill Zone":              kill_zone,
+        "Direction":              "Long" if side == "Buy" else "Short",
+        "HTF Bias":               bias.capitalize(),
+        "HTF POI Type":           poi_label,
+        "Premium/Discount":       "Discount" if bias == "bullish" else "Premium",
+        "Sweep Direction":        "SSL" if bias == "bullish" else "BSL",
+        "Liquidity Sweep":        "Yes",
+        "5M MSS/BOS":             "Yes",
+        "MSS Strength":           mss_strength,
+        "Entry Type":             entry_type,
+        "Entry TF":               "5M",
+        "Entry Price":            round(price, 2),
+        "Stop Loss":              round(sl, 2),
+        "TP1":                    round(tp1_price, 2),
+        "TP2":                    round(tp, 2),
+        "Risk (pips)":            risk_pts,
+        "Reward TP1 (pips)":      reward_tp1,
+        "Reward TP2 (pips)":      reward_tp2,
+        "Planned RR TP1":         round(tp1_r, 2),
+        "Planned RR TP2":         planned_rr_tp2,
+        "MAE":                    "",
+        "MFE":                    "",
+        "Result":                 "",
+        "Actual R Multiple":      "",
+        "News Nearby":            "",
+        "Confluence Score (1-5)": "",
+        "Rule Compliance":        "",
+        "Screenshot Before":      "",
+        "Screenshot After":       "",
+        "Notes":                  f"mode={mode} poi=[{active['low']:.2f}-{active['high']:.2f}] sweep_level={sweep['swept_level']:.2f}",
     })
 
     if signal_only:
