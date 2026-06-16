@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-from smc_bot import confirmation, data, executor, fib as fib_mod, liquidity, poi, structure  # noqa: E402
+from smc_bot import confirmation, data, executor, fib as fib_mod, liquidity, poi, structure, targets as tgt_mod  # noqa: E402
 
 with open(ROOT / "smc_bot" / "config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -104,10 +104,27 @@ def _analyze_pipeline(df_1h, df_5m) -> dict:
         swing_n = CFG["structure"]["swing_n"]
         bias    = structure.get_bias(df_1h, swing_n=swing_n)
 
-        # ── Fib 50% filter ────────────────────────────────────────────────────
+        # ── Fib 50% filter + swing range ──────────────────────────────────────
         fib_mid    = fib_mod.get_fib_midpoint(df_1h, bias, swing_n=swing_n) if bias != "neutral" else None
         fib_ok     = fib_mod.fib_filter(price, bias, fib_mid) if fib_mid is not None else False
         fib_zone   = "discount" if bias == "bullish" else "premium"
+
+        # ── BSL / SSL liquidity pools ─────────────────────────────────────────
+        tc       = CFG.get("targets", {})
+        _tol     = tc.get("equal_level_tolerance", 0.002)
+        _swing_t = CFG["structure"]["swing_n"]
+        bsl_levels = tgt_mod.get_bsl_levels(df_1h, swing_n=_swing_t, tolerance=_tol) if bias != "neutral" else []
+        ssl_levels = tgt_mod.get_ssl_levels(df_1h, swing_n=_swing_t, tolerance=_tol) if bias != "neutral" else []
+
+        # Derive swing high / swing low for the dealing-range indicator
+        swing_high = swing_low = None
+        if bias != "neutral":
+            _sh = structure._swing_highs(df_1h["high"].values, swing_n)
+            _sl = structure._swing_lows(df_1h["low"].values, swing_n)
+            if _sh:
+                swing_high = float(df_1h["high"].values[_sh[-1]])
+            if _sl:
+                swing_low  = float(df_1h["low"].values[_sl[-1]])
 
         # ── 1H POI zones ──────────────────────────────────────────────────────
         poi_zones_raw = poi.get_pois(
@@ -226,6 +243,10 @@ def _analyze_pipeline(df_1h, df_5m) -> dict:
             "signal":          signal,
             "stage":           stage,
             "blocker":         blocker,
+            "swing_high":      swing_high,
+            "swing_low":       swing_low,
+            "bsl_levels":      bsl_levels,
+            "ssl_levels":      ssl_levels,
         }
     except Exception as exc:
         import traceback; traceback.print_exc()
@@ -275,7 +296,7 @@ def _render_chart_svg(df_5m, pipe: dict, position: dict) -> str:
 
     # Canvas
     W, H          = 1020, 430
-    ML, MR, MT, MB = 68, 168, 44, 34
+    ML, MR, MT, MB = 68, 190, 44, 34
     CW = W - ML - MR    # 784
     CH = H - MT - MB    # 352
 
@@ -285,9 +306,11 @@ def _render_chart_svg(df_5m, pipe: dict, position: dict) -> str:
     extras = []
     for z in pipe.get("poi_zones", []):
         extras += [z["low"], z["high"]]
-    for k in ("sweep_level", "sweep_wick", "choch_ref_level"):
+    for k in ("sweep_level", "sweep_wick", "choch_ref_level", "swing_high", "swing_low", "fib_mid"):
         if pipe.get(k):
             extras.append(pipe[k])
+    for lvl in pipe.get("bsl_levels", []) + pipe.get("ssl_levels", []):
+        extras.append(lvl)
     if position.get("open"):
         for k in ("sl", "tp"):
             try:
@@ -337,37 +360,257 @@ def _render_chart_svg(df_5m, pipe: dict, position: dict) -> str:
     # Chart border
     o.append(f'<rect x="{ML}" y="{MT}" width="{CW}" height="{CH}" fill="none" stroke="#1c2230" stroke-width="1"/>')
 
+    # ── Dealing Range indicator (swing high / 50% mid / swing low) ────────────
+    s_hi  = pipe.get("swing_high")
+    s_lo  = pipe.get("swing_low")
+    f_mid = pipe.get("fib_mid")
+
+    if s_hi and s_lo and s_hi > s_lo:
+        ysh = py(s_hi)
+        ysl = py(s_lo)
+        ymid = py(f_mid) if f_mid else (ysh + ysl) / 2
+
+        # Discount zone (swing_low → mid): subtle green fill
+        disc_top = ymid
+        disc_bot = ysl
+        if disc_bot > disc_top:
+            o.append(
+                f'<rect x="{ML}" y="{disc_top:.1f}" width="{CW}" '
+                f'height="{disc_bot - disc_top:.1f}" fill="#0a1f0a" opacity="0.55"/>'
+            )
+            o.append(
+                f'<text x="{ML + CW - 6}" y="{(disc_top + disc_bot) / 2 + 4:.1f}" '
+                f'text-anchor="end" fill="#204a20" font-family="monospace" '
+                f'font-size="9" font-weight="600" opacity="0.9">DISCOUNT</text>'
+            )
+
+        # Premium zone (mid → swing_high): subtle red fill
+        prem_top = ysh
+        prem_bot = ymid
+        if prem_bot > prem_top:
+            o.append(
+                f'<rect x="{ML}" y="{prem_top:.1f}" width="{CW}" '
+                f'height="{prem_bot - prem_top:.1f}" fill="#1f0a0a" opacity="0.55"/>'
+            )
+            o.append(
+                f'<text x="{ML + CW - 6}" y="{(prem_top + prem_bot) / 2 + 4:.1f}" '
+                f'text-anchor="end" fill="#4a2020" font-family="monospace" '
+                f'font-size="9" font-weight="600" opacity="0.9">PREMIUM</text>'
+            )
+
+        # Swing High line
+        o.append(
+            f'<line x1="{ML}" y1="{ysh:.1f}" x2="{ML+CW}" y2="{ysh:.1f}" '
+            f'stroke="#7a3030" stroke-width="1.2" stroke-dasharray="8,4"/>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{ysh+4:.1f}" fill="#c05050" '
+            f'font-family="monospace" font-size="8.5">Swing H</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{ysh+14:.1f}" fill="#804040" '
+            f'font-family="monospace" font-size="8">{s_hi:,.0f}</text>'
+        )
+
+        # Swing Low line
+        o.append(
+            f'<line x1="{ML}" y1="{ysl:.1f}" x2="{ML+CW}" y2="{ysl:.1f}" '
+            f'stroke="#207a30" stroke-width="1.2" stroke-dasharray="8,4"/>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{ysl+4:.1f}" fill="#40c060" '
+            f'font-family="monospace" font-size="8.5">Swing L</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{ysl+14:.1f}" fill="#408050" '
+            f'font-family="monospace" font-size="8">{s_lo:,.0f}</text>'
+        )
+
+        # 50% Midpoint line
+        if f_mid:
+            o.append(
+                f'<line x1="{ML}" y1="{ymid:.1f}" x2="{ML+CW}" y2="{ymid:.1f}" '
+                f'stroke="#6060a0" stroke-width="1" stroke-dasharray="4,4"/>'
+            )
+            o.append(
+                f'<text x="{ML+CW+7}" y="{ymid+4:.1f}" fill="#8888cc" '
+                f'font-family="monospace" font-size="8.5">50% Mid</text>'
+            )
+            o.append(
+                f'<text x="{ML+CW+7}" y="{ymid+14:.1f}" fill="#6060a0" '
+                f'font-family="monospace" font-size="8">{f_mid:,.0f}</text>'
+            )
+
     # ── POI zones (under candles) ──────────────────────────────────────────────
+    # Chart filter: always show OBs; FVGs only within 2% of current price
+    cur_p = pipe.get("price") or float(df["close"].iloc[-1])
+    chart_zones = []
     for z in pipe.get("poi_zones", []):
+        if z["kind"] == "OB":
+            chart_zones.append(z)
+        else:
+            mid = (z["low"] + z["high"]) / 2
+            if cur_p and abs(mid - cur_p) / cur_p <= 0.02:
+                chart_zones.append(z)
+
+    # Draw FVGs first (behind OBs)
+    for z in chart_zones:
+        if z["kind"] != "FVG":
+            continue
         zy1 = py(z["high"])
         zy2 = py(z["low"])
         zh  = max(1.0, zy2 - zy1)
-        is_active = pipe.get("active_poi") == z or (
-            pipe.get("active_poi") and
-            pipe["active_poi"]["low"] == z["low"] and
-            pipe["active_poi"]["high"] == z["high"]
-        )
-        if z["kind"] == "OB":
-            fill, stroke, lbl_col = "#0d2540", "#1a4a80", "#4a9eff"
-        else:
-            fill, stroke, lbl_col = "#231a06", "#5a4010", "#d4a020"
-        opacity = "0.9" if is_active else "0.55"
+        mid_y = (zy1 + zy2) / 2 + 4
         o.append(
             f'<rect x="{ML}" y="{zy1:.1f}" width="{CW}" height="{zh:.1f}" '
-            f'fill="{fill}" stroke="{stroke}" stroke-width="0.5" opacity="{opacity}"/>'
+            f'fill="#1c1205" stroke="#6a5010" stroke-width="0.8" opacity="0.6"/>'
         )
-        # Kind label inside zone left edge
-        label_y = min(zy2 - 4, (zy1 + zy2) / 2 + 4)
+        # Dashed midline
+        o.append(
+            f'<line x1="{ML}" y1="{(zy1+zy2)/2:.1f}" x2="{ML+CW}" y2="{(zy1+zy2)/2:.1f}" '
+            f'stroke="#7a6018" stroke-width="0.6" stroke-dasharray="4,4" opacity="0.7"/>'
+        )
+        o.append(
+            f'<text x="{ML+6}" y="{mid_y:.1f}" fill="#c8950a" '
+            f'font-family="monospace" font-size="9" opacity="0.85">FVG</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+6}" y="{zy1+10:.1f}" fill="#9a7010" '
+            f'font-family="monospace" font-size="8">{z["high"]:,.0f}</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+6}" y="{zy2+1:.1f}" fill="#9a7010" '
+            f'font-family="monospace" font-size="8">{z["low"]:,.0f}</text>'
+        )
+
+    # Draw OBs on top with strong styling
+    for z in chart_zones:
+        if z["kind"] != "OB":
+            continue
+        zy1 = py(z["high"])
+        zy2 = py(z["low"])
+        zh  = max(2.0, zy2 - zy1)
+        mid_y = (zy1 + zy2) / 2
+        is_active = (
+            pipe.get("active_poi") is not None and
+            pipe["active_poi"].get("low") == z["low"] and
+            pipe["active_poi"].get("high") == z["high"]
+        )
+
+        if bias == "bullish":
+            fill   = "#0a2848" if not is_active else "#0d3a66"
+            stroke = "#2472c8" if not is_active else "#3a96ff"
+            lbl    = "#4a9eff"
+            border = "#3a8aff"
+        else:
+            fill   = "#2a0a12" if not is_active else "#3d0e1a"
+            stroke = "#c02840" if not is_active else "#ff3a5a"
+            lbl    = "#ff6070"
+            border = "#ff4060"
+
+        opacity = "1.0" if is_active else "0.82"
+
+        # Zone body
+        o.append(
+            f'<rect x="{ML}" y="{zy1:.1f}" width="{CW}" height="{zh:.1f}" '
+            f'fill="{fill}" stroke="{stroke}" stroke-width="1" opacity="{opacity}"/>'
+        )
+        # Bold left border
+        o.append(
+            f'<rect x="{ML}" y="{zy1:.1f}" width="3" height="{zh:.1f}" '
+            f'fill="{border}" opacity="{opacity}"/>'
+        )
+        # High line (top edge)
+        o.append(
+            f'<line x1="{ML}" y1="{zy1:.1f}" x2="{ML+CW}" y2="{zy1:.1f}" '
+            f'stroke="{stroke}" stroke-width="1.2" opacity="{opacity}"/>'
+        )
+        # Low line (bottom edge)
+        o.append(
+            f'<line x1="{ML}" y1="{zy2:.1f}" x2="{ML+CW}" y2="{zy2:.1f}" '
+            f'stroke="{stroke}" stroke-width="1.2" opacity="{opacity}"/>'
+        )
+        # "OB" label inside zone (left)
         active_mark = " ◀" if is_active else ""
+        label_y = max(zy1 + 12, min(zy2 - 3, mid_y + 4))
         o.append(
-            f'<text x="{ML+5}" y="{label_y:.1f}" fill="{lbl_col}" '
-            f'font-family="monospace" font-size="9" opacity="0.9">{z["kind"]}{active_mark}</text>'
+            f'<text x="{ML+7}" y="{label_y:.1f}" fill="{lbl}" '
+            f'font-family="monospace" font-size="10" font-weight="bold" opacity="0.95">'
+            f'OB{active_mark}</text>'
         )
-        # Right-side label
-        rl_y = (zy1 + zy2) / 2 + 4
+        # Right-side: "OB" label + High and Low prices
         o.append(
-            f'<text x="{ML+CW+8}" y="{rl_y:.1f}" fill="{lbl_col}" '
-            f'font-family="monospace" font-size="9">{z["kind"]}</text>'
+            f'<text x="{ML+CW+7}" y="{mid_y:.1f}" fill="{lbl}" '
+            f'font-family="monospace" font-size="9" font-weight="bold">OB</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{zy1+10:.1f}" fill="{stroke}" '
+            f'font-family="monospace" font-size="8">{z["high"]:,.0f}</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{zy2-2:.1f}" fill="{stroke}" '
+            f'font-family="monospace" font-size="8">{z["low"]:,.0f}</text>'
+        )
+
+    # ── BSL / SSL liquidity pools ──────────────────────────────────────────────
+    # BSL = equal-highs clusters (Buy-Side Liquidity) — TP target for longs
+    # SSL = equal-lows  clusters (Sell-Side Liquidity) — TP target for shorts
+    _liq_price = pipe.get("price") or (float(df["close"].iloc[-1]) if len(df) else 0)
+    bsl_all = sorted(pipe.get("bsl_levels", []))
+    ssl_all = sorted(pipe.get("ssl_levels", []))
+
+    # Limit to 4 nearest to current price each side to avoid clutter
+    bsl_near = sorted(bsl_all, key=lambda v: abs(v - _liq_price))[:4]
+    ssl_near = sorted(ssl_all, key=lambda v: abs(v - _liq_price))[:4]
+
+    # Identify the active TP target (nearest above price for longs / below for shorts)
+    _liq_bias = pipe.get("bias", "neutral")
+    tp_pool = None
+    if _liq_bias == "bullish":
+        cands = [v for v in bsl_near if v > _liq_price]
+        tp_pool = min(cands) if cands else None
+    elif _liq_bias == "bearish":
+        cands = [v for v in ssl_near if v < _liq_price]
+        tp_pool = max(cands) if cands else None
+
+    for lvl in bsl_near:
+        yl = py(lvl)
+        is_tp = (tp_pool is not None and abs(lvl - tp_pool) < 1)
+        col  = "#ffa040" if not is_tp else "#ffcc44"
+        dash = "5,4" if not is_tp else "0"
+        sw   = "1" if not is_tp else "1.6"
+        lbl  = "BSL" if not is_tp else "BSL ● TP"
+        o.append(
+            f'<line x1="{ML}" y1="{yl:.1f}" x2="{ML+CW}" y2="{yl:.1f}" '
+            f'stroke="{col}" stroke-width="{sw}" stroke-dasharray="{dash}" opacity="0.75"/>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{yl+4:.1f}" fill="{col}" '
+            f'font-family="monospace" font-size="8.5" font-weight="{"bold" if is_tp else "normal"}">{lbl}</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{yl+14:.1f}" fill="#a06820" '
+            f'font-family="monospace" font-size="8">{lvl:,.0f}</text>'
+        )
+
+    for lvl in ssl_near:
+        yl = py(lvl)
+        is_tp = (tp_pool is not None and abs(lvl - tp_pool) < 1)
+        col  = "#40a0d0" if not is_tp else "#44ddff"
+        dash = "5,4" if not is_tp else "0"
+        sw   = "1" if not is_tp else "1.6"
+        lbl  = "SSL" if not is_tp else "SSL ● TP"
+        o.append(
+            f'<line x1="{ML}" y1="{yl:.1f}" x2="{ML+CW}" y2="{yl:.1f}" '
+            f'stroke="{col}" stroke-width="{sw}" stroke-dasharray="{dash}" opacity="0.75"/>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{yl+4:.1f}" fill="{col}" '
+            f'font-family="monospace" font-size="8.5" font-weight="{"bold" if is_tp else "normal"}">{lbl}</text>'
+        )
+        o.append(
+            f'<text x="{ML+CW+7}" y="{yl+14:.1f}" fill="#207090" '
+            f'font-family="monospace" font-size="8">{lvl:,.0f}</text>'
         )
 
     # ── sweep & stop-hunt levels ───────────────────────────────────────────────
@@ -515,6 +758,120 @@ def _render_chart_svg(df_5m, pipe: dict, position: dict) -> str:
 
     o.append("</svg>")
     return "".join(o)
+
+
+# ── Order Block / FVG zones panel ────────────────────────────────────────────
+
+def _ob_zones_html(pipe: dict) -> str:
+    zones = pipe.get("poi_zones", [])
+    price = pipe.get("price", 0)
+    bias  = pipe.get("bias", "neutral")
+    active_poi = pipe.get("active_poi")
+
+    if not zones:
+        empty_msg = (
+            "No 1H OB/FVG zones detected."
+            if bias != "neutral"
+            else "No zones — bias is neutral (no clear HH+HL or LL+LH structure)."
+        )
+        return (
+            f'<div class="card full-width">'
+            f'<div class="card-title">1H Order Block &amp; FVG Zones</div>'
+            f'<div style="color:var(--muted);padding:12px 0;font-size:12px">{empty_msg}</div>'
+            f'</div>'
+        )
+
+    obs  = [z for z in zones if z.get("kind") == "OB"]
+    fvgs = [z for z in zones if z.get("kind") == "FVG"]
+
+    def _is_active(z: dict) -> bool:
+        if not active_poi:
+            return False
+        return z["low"] == active_poi.get("low") and z["high"] == active_poi.get("high")
+
+    def _dist_str(z: dict) -> str:
+        mid = (z["low"] + z["high"]) / 2
+        if z["low"] <= price <= z["high"]:
+            return '<span class="green" style="font-weight:700">● ACTIVE</span>'
+        d = price - mid
+        pct = abs(d) / price * 100
+        direction = "above" if d < 0 else "below"
+        return f'<span class="muted">${abs(d):,.0f} ({pct:.2f}%) {direction}</span>'
+
+    def _zone_row(z: dict) -> str:
+        kind = z.get("kind", "?")
+        tag_cls  = "tag-ob" if kind == "OB" else "tag-fvg"
+        width_usd = z["high"] - z["low"]
+        width_pct = width_usd / z["low"] * 100
+        active_mark = ' <span style="color:#4a9eff">◀</span>' if _is_active(z) else ""
+        return (
+            f'<tr>'
+            f'<td><span class="tag {tag_cls}">{kind}</span>{active_mark}</td>'
+            f'<td class="green">${z["high"]:,.2f}</td>'
+            f'<td class="red">${z["low"]:,.2f}</td>'
+            f'<td class="muted">${width_usd:,.2f} ({width_pct:.2f}%)</td>'
+            f'<td>{_dist_str(z)}</td>'
+            f'</tr>'
+        )
+
+    bias_col  = "#3fb950" if bias == "bullish" else "#f85149" if bias == "bearish" else "#6e7681"
+    bias_lbl  = bias.upper()
+    n_active  = 1 if active_poi else 0
+    active_badge = (
+        f'<span style="color:var(--green);font-weight:700;font-size:11px">● 1 ACTIVE</span>'
+        if n_active else
+        f'<span style="color:var(--muted);font-size:11px">none active</span>'
+    )
+
+    header_row = (
+        '<tr><th>Kind</th><th>High</th><th>Low</th>'
+        '<th>Width</th><th>Distance from price</th></tr>'
+    )
+    ob_rows  = "".join(_zone_row(z) for z in obs)
+    fvg_rows = "".join(_zone_row(z) for z in fvgs)
+
+    ob_section = ""
+    if obs:
+        ob_section = (
+            f'<div style="font-size:10px;font-weight:700;letter-spacing:.10em;'
+            f'text-transform:uppercase;color:#4a9eff;margin:0 0 6px">Order Blocks ({len(obs)})</div>'
+            f'<div style="overflow-x:auto;margin-bottom:14px">'
+            f'<table class="trades-table"><thead>{header_row}</thead>'
+            f'<tbody>{ob_rows}</tbody></table></div>'
+        )
+
+    fvg_section = ""
+    if fvgs:
+        fvg_section = (
+            f'<div style="font-size:10px;font-weight:700;letter-spacing:.10em;'
+            f'text-transform:uppercase;color:var(--orange);margin:0 0 6px">Fair Value Gaps ({len(fvgs)})</div>'
+            f'<div style="overflow-x:auto">'
+            f'<table class="trades-table"><thead>{header_row}</thead>'
+            f'<tbody>{fvg_rows}</tbody></table></div>'
+        )
+
+    note = (
+        '<div style="font-size:11px;color:var(--muted);margin-top:10px;border-top:1px solid var(--border);'
+        'padding-top:8px">'
+        '<strong style="color:#4a9eff">OB (Order Block)</strong> — last opposite candle before a '
+        f'displacement move ≥{CFG["poi"]["displacement_atr"]}×ATR. Entry zone per diagrams. '
+        '&nbsp;|&nbsp; '
+        '<strong style="color:var(--orange)">FVG (Fair Value Gap)</strong> — 3-candle imbalance; '
+        'confluence confirmation (bot enters OB, not standalone FVG).'
+        '</div>'
+    )
+
+    return (
+        f'<div class="card full-width">'
+        f'<div class="card-title" style="display:flex;justify-content:space-between;align-items:center">'
+        f'<span>1H Order Block &amp; FVG Zones</span>'
+        f'<span style="font-size:11px">'
+        f'<span style="color:{bias_col};font-weight:700">{bias_lbl}</span>'
+        f' &nbsp;·&nbsp; {len(zones)} zones &nbsp;·&nbsp; {active_badge}'
+        f'</span></div>'
+        f'{ob_section}{fvg_section}{note}'
+        f'</div>'
+    )
 
 
 # ── proximity explanation panel ───────────────────────────────────────────────
@@ -810,210 +1167,464 @@ a:hover { text-decoration: underline; }
 """
 
 
-# ── SMC Checklist panel ────────────────────────────────────────────────────────
+# ── Cycle flow panel ───────────────────────────────────────────────────────────
+
+def _cycle_flow_html() -> str:
+    """Static panel describing the per-5M-close execution path of bot.py."""
+
+    def step(n: str, label: str, detail: str, color: str = "#58a6ff", branch: str = "") -> str:
+        branch_html = (
+            f'<div style="margin-top:5px;font-size:10.5px;color:#d29922;border-left:2px solid #d29922;'
+            f'padding-left:8px">{branch}</div>'
+        ) if branch else ""
+        return (
+            f'<div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:10px">'
+            f'<div style="flex:0 0 22px;height:22px;border-radius:50%;background:{color}22;'
+            f'border:1.5px solid {color};font-size:10px;font-weight:700;color:{color};'
+            f'display:flex;align-items:center;justify-content:center;margin-top:1px">{n}</div>'
+            f'<div style="flex:1">'
+            f'<div style="font-size:12px;font-weight:700;color:{color};margin-bottom:2px">{label}</div>'
+            f'<div style="font-size:11.5px;color:#8a9ab0;line-height:1.55">{detail}</div>'
+            f'{branch_html}</div></div>'
+        )
+
+    def conn() -> str:
+        return '<div style="margin-left:10px;border-left:1.5px solid #2a3040;height:8px;margin-bottom:2px"></div>'
+
+    col1 = (
+        step("1", "Fetch balance",
+             "ccxt public call to Bybit. If the API fails 5 consecutive times the circuit-breaker "
+             "skips the rest of the cycle and logs a warning.",
+             "#58a6ff") +
+        conn() +
+        step("2", "trading_allowed?",
+             "Three pure-function guards in <code>risk.py</code>: <em>drawdown_breached</em> (equity vs peak), "
+             "<em>daily_loss_breached</em> (day-start equity vs now), <em>consecutive_losses_breached</em> "
+             "(counter vs limit). Any failure halts the cycle.",
+             "#d29922",
+             branch="⛔ Any guard fires → HALT. Telegram alert. Cycle ends.") +
+        conn() +
+        step("3", "Position already open?",
+             "<code>executor.get_position()</code>. If position is open, exit here (one-at-a-time rule). "
+             "If <code>open_order_id</code> is set but size=0, the trade just closed: query closed-PnL "
+             "filtered by <code>entry_time</code>, update loss counter, clear BotState, alert.",
+             "#c97dff",
+             branch="→ Position live: return (wait). → Position just closed: attribute PnL, update counter, persist state.") +
+        conn() +
+        step("4", "1H Bias",
+             "<code>structure.get_bias(df_1h)</code> — scans the 1H swing sequence. "
+             "HH+HL → bullish. LL+LH → bearish. Neutral if no pattern.",
+             "#3fb950",
+             branch="⬛ neutral → cycle ends immediately.") +
+        conn() +
+        step("5", "Fib 50% filter",
+             "<code>fib.get_fib_midpoint()</code> finds the 50% equilibrium of the most recent "
+             "swing range. <code>fib.fib_filter()</code> passes longs only in discount (price ≤ mid) "
+             "and shorts only in premium (price ≥ mid).",
+             "#e3b341",
+             branch="✗ price outside the correct half → cycle ends.") +
+        conn() +
+        step("6", "1H POI",
+             "<code>poi.get_pois(df_1h)</code> returns Order Block and FVG zones qualified by "
+             "≥1.5×ATR displacement. <code>poi.price_in_poi(price, zones)</code> checks whether the "
+             "current 5M price is already inside a zone.",
+             "#58a6ff",
+             branch="✗ no zones, or price not yet inside one → cycle ends.")
+    )
+
+    col2 = (
+        step("7", "5M Liquidity sweep",
+             "<code>liquidity.get_sweep(df_5m)</code> scans the last N 5M bars for a wick that "
+             "pierces a prior swing low (long) or swing high (short) and closes back above/below it — "
+             "the stop-hunt that absorbs retail orders.",
+             "#58a6ff",
+             branch="✗ no qualifying sweep → cycle ends.") +
+        conn() +
+        step("8", "Displacement gate",
+             "<code>liquidity.check_displacement(df_5m, sweep_bar)</code> — in the bars after the "
+             "sweep, at least one candle must have a range ≥ 1.5×ATR(14) in the trade direction. "
+             "Proves institutional momentum; rules out noise wicks.",
+             "#c97dff",
+             branch="✗ no displacement candle → cycle ends.") +
+        conn() +
+        step("9", "5M CHoCH",
+             "<code>confirmation.get_choch(df_5m)</code> — after the sweep a 5M bar must close "
+             "above the pre-sweep swing high (long) or below the pre-sweep swing low (short). "
+             "This Change of Character confirms the structural reversal.",
+             "#3fb950",
+             branch="✗ CHoCH not confirmed → cycle ends.") +
+        conn() +
+        step("10", "SL at sweep wick",
+             "Stop-loss computed from the sweep wick extreme with a buffer from config: "
+             "<code>wick × (1 − sl_buffer)</code> for longs, <code>wick × (1 + sl_buffer)</code> "
+             "for shorts. R = |entry − SL|.",
+             "#d29922") +
+        conn() +
+        step("11", "TP via targets.py",
+             "<code>targets.get_tp_level()</code> finds the nearest BSL cluster (equal highs) for longs "
+             "or SSL cluster (equal lows) for shorts that provides ≥ min_r reward. Falls back to "
+             "<code>fallback_r × stop_dist</code> if no qualifying pool exists.",
+             "#d29922") +
+        conn() +
+        step("12", "Position sizing",
+             "<code>risk.calc_qty(balance, sl_dist, risk_pct)</code> sizes to risk_pct of equity, "
+             "snaps to Bybit lot step. Returns 0.0 if result is below minimum — trade skipped cleanly.",
+             "#58a6ff",
+             branch="qty = 0 → log skip, cycle ends.") +
+        conn() +
+        step("13", "Log or Place",
+             "All gates passed. If <code>signal_only_mode=True</code>: write signal row to CSV and "
+             "send Telegram alert — no order sent. If <code>LIVE_TRADING=True</code>: "
+             "<code>executor.place_order()</code> sends a market entry with attached SL/TP, "
+             "verifies <code>retCode=0</code> and <code>orderId</code>, persists BotState, alerts.",
+             "#3fb950",
+             branch="signal_only → log + alert only. | LIVE=True → retCode-checked order + BotState flush + alert.")
+    )
+
+    return (
+        '<div class="card full-width">'
+        '<div class="card-title">Bot Cycle Flow — What Happens on Every 5M Close</div>'
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0 28px">'
+        f'<div>{col1}</div><div>{col2}</div>'
+        '</div></div>'
+    )
+
+
+# ── SMC Checklist panel (12-phase trade lifecycle) ────────────────────────────
 
 def _checklist_html() -> str:
     """
-    Interactive SMC Trading Checklist.
-    State is stored in localStorage so checks survive the 30s auto-refresh.
-    Grade is computed live in JS: A = all critical boxes (§1–§5) checked,
-    B = partial, C = missing critical items.
+    12-phase SMC trade lifecycle checklist.
+    State stored in localStorage — survives 30s auto-refresh.
+    Grade computed live in JS.
     """
     def item(cid: str, text: str) -> str:
         return (f'<div class="cl-item">'
                 f'<input type="checkbox" class="cl-box" id="{cid}" onchange="clSave(this)">'
                 f'<label for="{cid}">{text}</label></div>')
 
+    def nt(cid: str, text: str) -> str:
+        return (f'<div class="cl-item">'
+                f'<input type="checkbox" class="cl-box" id="{cid}" onchange="clSave(this)" '
+                f'style="border-color:#f85149">'
+                f'<label for="{cid}" style="color:#f85149">NO TRADE: {text}</label></div>')
+
     def note(text: str) -> str:
         return f'<div class="cl-note">{text}</div>'
 
-    s1 = f"""
+    def ph(num: str, title: str) -> str:
+        return (f'<div style="font-size:10px;font-weight:700;letter-spacing:.10em;'
+                f'text-transform:uppercase;color:var(--blue);margin:0 0 8px;'
+                f'padding-bottom:6px;border-bottom:1px solid var(--border)">'
+                f'Phase {num} — {title}</div>')
+
+    def sub(text: str) -> str:
+        return f'<div style="font-size:10px;font-weight:700;color:var(--orange);margin:8px 0 4px">{text}</div>'
+
+    # ── Phase 1 + 2 ──────────────────────────────────────────────────────────
+    p1_2 = f"""
     <div class="cl-card">
-      <div class="cl-h2">1 · Hard Filter: Market Context</div>
-      {item("c1a","Start on <strong>1H or 4H</strong>. Structure first, entry second.")}
-      {item("c1b","Bias is clear: trending or a confirmed CHoCH has shifted bias.")}
-      {item("c1c","External swing high/low is identified.")}
-      {item("c1d","Not trading random internal chop.")}
-      {note("If structure is unclear, there is no trade.")}
+      {ph("1", "Market Scan — HTF Bias")}
+      {item("p1a", "Trend is clear OR confirmed CHoCH has shifted bias")}
+      {item("p1b", "External swing high/low identified")}
+      {item("p1c", "Not trading random internal chop")}
+      {item("p1d", "Overall directional bias established")}
+      {nt("p1_nt_a", "HTF structure is unclear")}
+      {nt("p1_nt_b", "Market ranging without clear narrative")}
+
+      <div style="border-top:1px solid var(--border);margin:10px 0 8px"></div>
+      {ph("2", "Premium / Discount Location")}
+      {note("Draw dealing range: external swing low → swing high")}
+      {sub("Long")}
+      {item("p2a", "Current price is in Discount (<50% of range)")}
+      {sub("Short")}
+      {item("p2b", "Current price is in Premium (>50% of range)")}
+      {nt("p2_nt_a", "Price is in the middle of the range")}
+      {nt("p2_nt_b", "Buying premium or selling discount")}
     </div>"""
 
-    s2 = f"""
+    # ── Phase 3 ──────────────────────────────────────────────────────────────
+    p3 = f"""
     <div class="cl-card">
-      <div class="cl-h2">2 · Premium / Discount Filter</div>
-      {item("c2a","Dealing range drawn from relevant external swing low → high.")}
-      {item("c2b","<strong>Buy only in discount</strong> (below 50% of range).")}
-      {item("c2c","<strong>Sell only in premium</strong> (above 50% of range).")}
-      {item("c2d","Not buying high or selling low in the middle of the range.")}
+      {ph("3", "POI Identification")}
+      {sub("Order Block")}
+      {item("p3a", "OB aligns with meaningful BOS or CHoCH")}
+      {item("p3b", "Strong displacement away from OB")}
+      {item("p3c", "OB remains fresh / unmitigated")}
+      {item("p3d", "Liquidity confluence exists")}
+      {item("p3e", "FVG confluence exists")}
+      {sub("Fair Value Gap")}
+      {item("p3f", "FVG caused meaningful BOS or CHoCH")}
+      {item("p3g", "FVG aligns with trend or confirmed reversal")}
+      {item("p3h", "FVG remains unmitigated")}
+      {sub("POI Selected")}
+      {item("p3_ob", "Order Block")}
+      {item("p3_fvg", "Fair Value Gap")}
+      {item("p3_both", "OB + FVG Combination")}
+      {nt("p3_nt_a", "OB lacks displacement")}
+      {nt("p3_nt_b", "FVG did not create BOS/CHoCH")}
+      {nt("p3_nt_c", "Zone already mitigated")}
     </div>"""
 
-    s3 = f"""
+    # ── Phase 4 ──────────────────────────────────────────────────────────────
+    p4 = f"""
     <div class="cl-card">
-      <div class="cl-h2">3 · Valid HTF POI</div>
-      <div class="cl-h3">Order Block</div>
-      {item("c3a","OB aligns with a meaningful <strong>BOS or CHoCH</strong>.")}
-      {item("c3b","The move away showed <strong>displacement</strong> / urgency.")}
-      {item("c3c","OB is still <strong>fresh / unmitigated</strong>.")}
-      {item("c3d","Extra confluence: nearby liquidity and/or FVG.")}
-      <div class="cl-h3">Fair Value Gap</div>
-      {item("c3e","FVG formed from a move that caused an external BOS or CHoCH.")}
-      {item("c3f","FVG is with trend or with a confirmed reversal.")}
-      {item("c3g","FVG is still unmitigated.")}
+      {ph("4", "Liquidity Narrative")}
+      {sub("Liquidity To Be Swept")}
+      {item("p4a", "Equal highs")}
+      {item("p4b", "Equal lows")}
+      {item("p4c", "Previous day high")}
+      {item("p4d", "Previous day low")}
+      {item("p4e", "Session high / low")}
+      {item("p4f", "Swing high / low")}
+      {sub("Target After Entry")}
+      {item("p4g", "Internal liquidity identified")}
+      {item("p4h", "External liquidity identified")}
+      {item("p4i", "Target pool is significant enough")}
+      {nt("p4_nt_a", "Liquidity story is unclear")}
+      {nt("p4_nt_b", "No obvious target pool exists")}
     </div>"""
 
-    s4 = f"""
+    # ── Phase 5 + 9 ──────────────────────────────────────────────────────────
+    p5_9 = f"""
     <div class="cl-card">
-      <div class="cl-h2">4 · Liquidity Story</div>
-      {item("c4a","Liquidity marked: equal highs/lows, prior session H/L, swing points.")}
-      {item("c4b","Know what price is likely to sweep <strong>before</strong> the move.")}
-      {item("c4c","Know what liquidity I am targeting <strong>after</strong> entry.")}
-      {item("c4d","Target pool is large enough to justify the risk.")}
+      {ph("5", "Wait for POI")}
+      {item("p5a", "Price has reached HTF POI")}
+      {item("p5b", "No early entry before POI")}
+      {item("p5c", "Market is reacting inside the zone")}
+      {item("p5d", "Waiting for confirmation, not predicting")}
+
+      <div style="border-top:1px solid var(--border);margin:10px 0 8px"></div>
+      {ph("9", "Session Filter")}
+      {item("p9a", "Trading during active market session")}
+      {item("p9b", "Avoiding low-volume chop")}
+      {item("p9c", "Not entering directly into major news")}
+      {sub("Session")}
+      {item("p9_lon", "London")}
+      {item("p9_ny",  "New York")}
+      {item("p9_asi", "Asia")}
+      {item("p9_cry", "Crypto Active Hours")}
+      {nt("p9_nt", "Outside active session — bot session filter is OFF (future trial)")}
     </div>"""
 
-    s5 = f"""
+    # ── Phase 6 ──────────────────────────────────────────────────────────────
+    p6 = f"""
     <div class="cl-card">
-      <div class="cl-h2">5 · LTF Confirmation</div>
-      {item("c5a","Price reached the HTF POI first.")}
-      {item("c5b","A <strong>liquidity sweep</strong> occurred inside/just before the zone.")}
-      {item("c5c","A valid <strong>5M CHoCH / MSS / BOS</strong> formed after the sweep.")}
-      {item("c5d","Displacement leg created a new 5M OB and/or FVG.")}
-      {item("c5e","Waiting for retrace into execution zone, not chasing the impulse.")}
+      {ph("6", "LTF Confirmation (5M)")}
+      {sub("Sweep")}
+      {item("p6a", "Liquidity sweep occurred")}
+      {sub("Structure Shift")}
+      {item("p6b", "Valid CHoCH formed")}
+      {item("p6c", "Valid MSS formed")}
+      {item("p6d", "Valid BOS formed")}
+      {sub("Displacement")}
+      {item("p6e", "Strong displacement candle appeared")}
+      {item("p6f", "New 5M OB created")}
+      {item("p6g", "New 5M FVG created")}
+      {sub("Retracement")}
+      {item("p6h", "Waiting for retrace into execution zone")}
+      {item("p6i", "Not chasing impulse candles")}
+      {nt("p6_nt_a", "No sweep")}
+      {nt("p6_nt_b", "No structure shift (CHoCH / MSS / BOS)")}
+      {nt("p6_nt_c", "No displacement")}
     </div>"""
 
-    s6 = f"""
+    # ── Phase 7 ──────────────────────────────────────────────────────────────
+    p7 = f"""
     <div class="cl-card">
-      <div class="cl-h2">6 · Entry Model</div>
-      <table class="cl-table">
-        <tr><th>Type</th><th>When</th><th>Entry</th></tr>
-        <tr><td><strong>Confirmation</strong></td><td>Default model</td><td>Retrace into 5M OB/FVG after sweep + CHoCH</td></tr>
-        <tr><td>Refined</td><td>Very clean setup</td><td>50% of impulse / OB midpoint / FVG midpoint</td></tr>
-        <tr><td>Aggressive</td><td>Exceptional confluence only</td><td>Direct touch of HTF POI with defined SL</td></tr>
-      </table>
-      {item("c6a","Default choice: Confirmation. Aggressive only if confluence is exceptional.")}
+      {ph("7", "Execution — Entry Model")}
+      {sub("Confirmation (Preferred)")}
+      {item("p7a", "Retest of 5M OB")}
+      {item("p7b", "Retest of 5M FVG")}
+      {item("p7c", "Entry after sweep + CHoCH/BOS")}
+      {sub("Refined")}
+      {item("p7d", "50% retracement of impulse")}
+      {item("p7e", "OB midpoint / FVG midpoint")}
+      {sub("Aggressive")}
+      {item("p7f", "Direct touch of HTF POI")}
+      {item("p7g", "Exceptional confluence present")}
+      {sub("Selected Model")}
+      {item("p7_conf", "Confirmation")}
+      {item("p7_ref",  "Refined")}
+      {item("p7_agg",  "Aggressive")}
     </div>"""
 
-    s7 = f"""
+    # ── Phase 8 ──────────────────────────────────────────────────────────────
+    p8 = f"""
     <div class="cl-card">
-      <div class="cl-h2">7 · Stop Loss Rules</div>
-      {item("c7a","SL goes <strong>beyond invalidation</strong>, not a random tight distance.")}
-      {item("c7b","Buy: SL below sweep low or below OB/FVG invalidation.")}
-      {item("c7c","Sell: SL above sweep high or above OB/FVG invalidation.")}
-      {item("c7d","If stop is too wide, reduce size or skip the trade.")}
+      {ph("8", "Risk Management — Stop Loss")}
+      {sub("Long")}
+      {item("p8a", "SL below sweep low")}
+      {item("p8b", "SL below OB/FVG invalidation")}
+      {sub("Short")}
+      {item("p8c", "SL above sweep high")}
+      {item("p8d", "SL above OB/FVG invalidation")}
+      {sub("Risk Check")}
+      {item("p8e", "Stop is placed beyond invalidation")}
+      {item("p8f", "Position size adjusted correctly")}
+      {item("p8g", "Risk % acceptable")}
+      {nt("p8_nt_a", "Stop placement is arbitrary")}
+      {nt("p8_nt_b", "Required position size exceeds risk limits")}
     </div>"""
 
-    s8 = f"""
+    # ── Phase 10 ─────────────────────────────────────────────────────────────
+    p10 = f"""
     <div class="cl-card">
-      <div class="cl-h2">8 · Take Profit Rules</div>
-      {item("c8a","TP1 = nearest internal liquidity / first logical reaction point.")}
-      {item("c8b","TP2 = structural high/low or external liquidity (BSL/SSL).")}
-      {item("c8c","Exit plan is defined <strong>before</strong> entry.")}
-      {item("c8d","Minimum R:R acceptable for setup type (Confirmation ≥ 1:2).")}
+      {ph("10", "Profit Planning")}
+      {sub("TP1")}
+      {item("p10a", "Nearest internal liquidity identified")}
+      {sub("TP2")}
+      {item("p10b", "Structural high/low as target")}
+      {item("p10c", "External liquidity pool as target")}
+      {sub("R:R Check")}
+      {note("Confirmation ≥ 1:2 preferred / 1:3 ideal · Refined ≥ 1:3 · Aggressive ≥ 1:2 minimum")}
+      {item("p10d", "RR meets minimum for selected entry model")}
+      {nt("p10_nt", "RR below minimum threshold — do not enter")}
     </div>"""
 
-    s9 = f"""
-    <div class="cl-card">
-      <div class="cl-h2">9 · Session / Timing</div>
-      {item("c9a","Prefer high-volume windows: <strong>London</strong> and <strong>New York</strong>.")}
-      {item("c9b","Not forcing entries in low-volume chop or right into major news.")}
-      {item("c9c","For BTC: active session is London open + NY session (08:00–21:00 UTC).")}
-    </div>"""
-
-    s10 = f"""
-    <div class="cl-card">
-      <div class="cl-h2">10 · Auto No-Trade Conditions</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
-        <div>
-          {item("c10a","No clear HTF bias.")}
-          {item("c10b","POI already mitigated.")}
-          {item("c10c","FVG did not cause external BOS/CHoCH.")}
-          {item("c10d","OB has no displacement / no intent.")}
-        </div>
-        <div>
-          {item("c10e","No 5M sweep.")}
-          {item("c10f","No lower-timeframe structural shift.")}
-          {item("c10g","R:R below minimum plan.")}
-          {item("c10h","Trade is driven by FOMO.")}
-        </div>
-      </div>
-    </div>"""
-
-    grade_section = """
+    # ── Phase 11 + Grade ─────────────────────────────────────────────────────
+    p11 = f"""
     <div class="cl-card full">
-      <div class="cl-h2" style="display:flex;justify-content:space-between;align-items:center">
-        Final Grade
-        <button class="cl-reset" onclick="clReset()">Reset all</button>
-      </div>
+      {ph("11", "Final Grade — Execution Decision")}
       <div class="cl-progress"><div class="cl-progress-bar" id="clProg" style="width:0%"></div></div>
       <div class="grade-bar">
-        <div class="grade-box grade-inactive" id="grA">A SETUP</div>
-        <div class="grade-box grade-inactive" id="grB">B SETUP</div>
-        <div class="grade-box grade-inactive" id="grC">C SETUP</div>
+        <div class="grade-box grade-inactive" id="grA">A — FULL RISK</div>
+        <div class="grade-box grade-inactive" id="grB">B — REDUCED RISK</div>
+        <div class="grade-box grade-inactive" id="grC">C — NO TRADE</div>
       </div>
       <table class="cl-table">
         <tr><th>Grade</th><th>Requirements</th><th>Action</th></tr>
         <tr><td style="color:var(--green);font-weight:700">A</td>
-            <td>Clear HTF bias + discount/premium + fresh POI + sweep + LTF confirmation + clean R:R</td>
-            <td style="color:var(--green)">Take normal risk</td></tr>
+            <td>Clear HTF bias + discount/premium + fresh POI + sweep + LTF shift + strong RR</td>
+            <td style="color:var(--green)">Full risk per plan</td></tr>
         <tr><td style="color:var(--orange);font-weight:700">B</td>
-            <td>One non-critical weakness but structure still clean</td>
+            <td>One minor weakness — structure still valid</td>
             <td style="color:var(--orange)">Reduce size or be selective</td></tr>
         <tr><td style="color:var(--red);font-weight:700">C</td>
-            <td>Missing structure, confirmation, or clean target</td>
+            <td>Missing critical component or any NO-TRADE box checked</td>
             <td style="color:var(--red)">No trade</td></tr>
       </table>
+      <button class="cl-reset" onclick="clReset()" style="margin-top:10px">Reset all</button>
     </div>"""
 
-    # Critical checkboxes (must all be checked for A grade)
-    critical = ["c1a","c1b","c1c","c2b","c2c","c3a","c3b","c3c","c4a","c4b","c4c",
-                "c5a","c5b","c5c","c5e","c7a","c8a","c8b","c8c"]
-    critical_js = str(critical).replace("'", '"')
+    # ── Phase 12 + Exit ──────────────────────────────────────────────────────
+    p12 = f"""
+    <div class="cl-card">
+      {ph("12", "Trade Management (After Entry)")}
+      {item("p12a", "Trade executed according to plan")}
+      {item("p12b", "No moving SL emotionally")}
+      {item("p12c", "No adding to losers")}
+      {item("p12d", "TP1 managed according to plan")}
+      {item("p12e", "Partial profit rules followed")}
+      {item("p12f", "Break-even rules followed")}
+      {item("p12g", "No discretionary interference")}
+    </div>"""
+
+    p_exit = f"""
+    <div class="cl-card">
+      {ph("12", "Exit & Journal")}
+      {sub("Outcome")}
+      {item("ex_tp1", "TP1 Hit")}
+      {item("ex_tp2", "TP2 Hit")}
+      {item("ex_full", "Full TP")}
+      {item("ex_be",   "Break Even")}
+      {item("ex_sl",   "Stop Loss")}
+      {sub("Post-Trade Review")}
+      {item("ex_r1", "Followed checklist completely")}
+      {item("ex_r2", "Followed risk rules")}
+      {item("ex_r3", "Followed entry model")}
+      {item("ex_r4", "Emotional mistakes noted")}
+      {item("ex_r5", "Screenshots saved")}
+    </div>"""
+
+    # Critical checkboxes → all required for Grade A
+    critical = [
+        "p1a","p1b","p1c",
+        "p5a","p5b",
+        "p6a","p6e",
+        "p8e","p8f",
+        "p10d",
+        "p4g","p4h","p4i",
+    ]
+    # No-trade checkboxes → any checked = Grade C
+    no_trade = [
+        "p1_nt_a","p1_nt_b",
+        "p2_nt_a","p2_nt_b",
+        "p3_nt_a","p3_nt_b","p3_nt_c",
+        "p4_nt_a","p4_nt_b",
+        "p6_nt_a","p6_nt_b","p6_nt_c",
+        "p8_nt_a","p8_nt_b",
+        "p9_nt",
+        "p10_nt",
+    ]
+    all_ids = [
+        "p1a","p1b","p1c","p1d","p1_nt_a","p1_nt_b",
+        "p2a","p2b","p2_nt_a","p2_nt_b",
+        "p3a","p3b","p3c","p3d","p3e","p3f","p3g","p3h",
+        "p3_ob","p3_fvg","p3_both","p3_nt_a","p3_nt_b","p3_nt_c",
+        "p4a","p4b","p4c","p4d","p4e","p4f","p4g","p4h","p4i","p4_nt_a","p4_nt_b",
+        "p5a","p5b","p5c","p5d",
+        "p6a","p6b","p6c","p6d","p6e","p6f","p6g","p6h","p6i",
+        "p6_nt_a","p6_nt_b","p6_nt_c",
+        "p7a","p7b","p7c","p7d","p7e","p7f","p7g","p7_conf","p7_ref","p7_agg",
+        "p8a","p8b","p8c","p8d","p8e","p8f","p8g","p8_nt_a","p8_nt_b",
+        "p9a","p9b","p9c","p9_lon","p9_ny","p9_asi","p9_cry","p9_nt",
+        "p10a","p10b","p10c","p10d","p10_nt",
+        "p12a","p12b","p12c","p12d","p12e","p12f","p12g",
+        "ex_tp1","ex_tp2","ex_full","ex_be","ex_sl",
+        "ex_r1","ex_r2","ex_r3","ex_r4","ex_r5",
+    ]
+
+    critical_js  = str(critical).replace("'", '"')
+    no_trade_js  = str(no_trade).replace("'", '"')
+    all_ids_js   = str(all_ids).replace("'", '"')
 
     js = f"""
     <script>
-    const CL_KEY = 'smc_checklist_v1';
-    const CRITICAL = {critical_js};
-    const ALL_IDS = ["c1a","c1b","c1c","c1d","c2a","c2b","c2c","c2d",
-      "c3a","c3b","c3c","c3d","c3e","c3f","c3g","c4a","c4b","c4c","c4d",
-      "c5a","c5b","c5c","c5d","c5e","c6a","c7a","c7b","c7c","c7d",
-      "c8a","c8b","c8c","c8d","c9a","c9b","c9c",
-      "c10a","c10b","c10c","c10d","c10e","c10f","c10g","c10h"];
+    const CL_KEY2   = 'smc_cl_v2';
+    const CRITICAL2 = {critical_js};
+    const NO_TRADE2 = {no_trade_js};
+    const ALL2      = {all_ids_js};
 
     function clLoad() {{
-      const saved = JSON.parse(localStorage.getItem(CL_KEY) || '{{}}');
-      ALL_IDS.forEach(id => {{
+      const saved = JSON.parse(localStorage.getItem(CL_KEY2) || '{{}}');
+      ALL2.forEach(id => {{
         const el = document.getElementById(id);
         if (el) el.checked = !!saved[id];
       }});
       clGrade();
     }}
     function clSave(el) {{
-      const saved = JSON.parse(localStorage.getItem(CL_KEY) || '{{}}');
+      const saved = JSON.parse(localStorage.getItem(CL_KEY2) || '{{}}');
       saved[el.id] = el.checked;
-      localStorage.setItem(CL_KEY, JSON.stringify(saved));
+      localStorage.setItem(CL_KEY2, JSON.stringify(saved));
       clGrade();
     }}
     function clReset() {{
-      localStorage.removeItem(CL_KEY);
-      ALL_IDS.forEach(id => {{ const el = document.getElementById(id); if (el) el.checked = false; }});
+      localStorage.removeItem(CL_KEY2);
+      ALL2.forEach(id => {{ const el = document.getElementById(id); if (el) el.checked = false; }});
       clGrade();
     }}
     function clGrade() {{
-      const checked = new Set(ALL_IDS.filter(id => {{ const el = document.getElementById(id); return el && el.checked; }}));
-      const total = ALL_IDS.length;
+      const checked = new Set(ALL2.filter(id => {{ const el = document.getElementById(id); return el && el.checked; }}));
+      const total = ALL2.length;
       const done  = checked.size;
       const pct   = total ? Math.round(done / total * 100) : 0;
       const prog  = document.getElementById('clProg');
       if (prog) prog.style.width = pct + '%';
 
-      const critDone   = CRITICAL.every(id => checked.has(id));
-      const noTradeFail= ["c10a","c10b","c10c","c10d","c10e","c10f"].some(id => checked.has(id));
-      const fomoFail   = checked.has("c10h");
+      const ntFail  = NO_TRADE2.some(id => checked.has(id));
+      const critOk  = CRITICAL2.every(id => checked.has(id));
+      const shiftOk = checked.has('p6b') || checked.has('p6c') || checked.has('p6d');
+      const pdOk    = checked.has('p2a') || checked.has('p2b');
+      const poiOk   = checked.has('p3_ob') || checked.has('p3_fvg') || checked.has('p3_both');
 
       let grade = 'C';
-      if (noTradeFail || fomoFail) {{
+      if (ntFail) {{
         grade = 'C';
-      }} else if (critDone && done >= Math.round(total * 0.80)) {{
+      }} else if (critOk && shiftOk && pdOk && poiOk && done >= Math.round(total * 0.70)) {{
         grade = 'A';
-      }} else if (done >= Math.round(total * 0.50)) {{
+      }} else if (done >= Math.round(total * 0.45)) {{
         grade = 'B';
       }}
 
@@ -1029,9 +1640,9 @@ def _checklist_html() -> str:
 
     return f"""
     <div class="card full-width">
-      <div class="card-title">SMC Trading Checklist — Pre-Trade Quality Gate</div>
+      <div class="card-title">SMC Trade Lifecycle Checklist — Scan → Entry → Management → Journal</div>
       <div class="cl-grid">
-        {s1}{s2}{s3}{s4}{s5}{s6}{s7}{s8}{s9}{s10}{grade_section}
+        {p1_2}{p3}{p4}{p5_9}{p6}{p7}{p8}{p10}{p11}{p12}{p_exit}
       </div>
       {js}
     </div>"""
@@ -1167,8 +1778,14 @@ def _build_html(
       {chart_svg}
     </div>"""
 
+    # OB zones panel
+    ob_zones_html = _ob_zones_html(pipe)
+
     # Proximity panel
     proximity_html = _proximity_html(pipe, position)
+
+    # Cycle flow
+    cycle_flow_html = _cycle_flow_html()
 
     # Stats card
     stats = _stats(trades)
@@ -1258,7 +1875,9 @@ def _build_html(
   {header}
   <div class="grid-3">{acct_html}{pos_html}{pipe_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{chart_html}</div>
+  <div class="grid-2" style="margin-bottom:12px">{ob_zones_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{proximity_html}</div>
+  <div class="grid-2" style="margin-bottom:12px">{cycle_flow_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{st_html}{links_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{trades_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{checklist_html}</div>

@@ -1,7 +1,7 @@
 exchange:
   symbol: BTCUSDT
-  htf: 1h       # 1H bias + POI
-  ltf: 5m       # 5M execution
+  htf: 4h       # 4H bias + POI (Trial 21 PASS — 4H+1H chain)
+  ltf: 1h       # 1H sweep + displacement + CHoCH execution
   # API keys come from .env (BYBIT_API_KEY / BYBIT_API_SECRET)
   # LIVE_TRADING must be False; only the owner flips it manually
 
@@ -11,37 +11,37 @@ bybit:
 
 risk:
   risk_pct: 0.005         # 0.5% of balance per trade (§5 non-bypassable; 0.25% in Phase 2)
-  target_r: 2.0           # 2R fixed TP
+  target_r: 2.0           # 2R fixed exit (4H+1H baseline)
   sl_buffer: 0.001        # 0.1% pad below/above sweep wick for SL
   max_daily_loss: 0.02    # 2% — halt trading for the rest of the day
   max_drawdown: 0.10      # 10% from peak — kill switch
   max_consecutive_losses: 2  # halt after N losses in a row (resets on any win)
 
 structure:
-  swing_n: 5        # bars each side to confirm a swing high/low (1H)
+  swing_n: 5        # bars each side to confirm a swing high/low (4H)
 
 fib:
   level: 0.5        # discount/premium boundary (50% of swing range)
                     # longs require price <= midpoint; shorts require price >= midpoint
 
 poi:
-  ob_lookback: 50   # max 1H bars to scan backwards for OBs
-  fvg_lookback: 30  # max 1H bars to scan backwards for FVGs
-  displacement_atr: 1.5   # OB displacement must be >= N × ATR(14)
+  ob_lookback: 50   # max 4H bars to scan backwards for OBs (~200 days)
+  fvg_lookback: 30  # max 4H bars to scan backwards for FVGs (~120 days)
+  displacement_atr: 1.5   # 4H OB displacement must be >= 1.5 × ATR(14)
 
 liquidity:
-  swing_n: 3        # bars each side for 5M swing detection
-  lookback: 30      # how many 5M bars to scan for prior swing levels
-  displacement_atr: 1.5   # post-sweep displacement gate: candle must be >= N × ATR
-  ltf_poi_lookback: 15    # bars after sweep to scan for 5M entry OB/FVG
+  swing_n: 3        # bars each side for 1H swing detection
+  lookback: 30      # how many 1H bars to scan for prior swing levels
+  displacement_atr: 1.0   # Trial 21 baseline: 1.0×ATR post-sweep displacement gate
+  ltf_poi_lookback: 15    # bars after sweep to scan for 1H entry OB/FVG
 
 confirmation:
-  lookback: 10      # bars before sweep to establish the CHoCH reference level
+  lookback: 10      # 1H bars before sweep to establish the CHoCH reference level
 
 targets:
   equal_level_tolerance: 0.002   # 0.2% — swing highs/lows within this % form a cluster
-  min_r: 1.5                     # BSL/SSL cluster must be >= N×R away; else skip (use 2R fallback)
-  fallback_r: 2.0                # fixed-R fallback when no liquidity pool qualifies
+  min_r: 1.5                     # BSL/SSL pool must be >=1.5R from entry
+  fallback_r: 2.0                # fixed-R fallback when no pool qualifies
 
 partials:
   tp1_r: 1.0          # close tp1_pct of position at 1R (move SL to BE)
@@ -49,10 +49,16 @@ partials:
   tp2_at_liquidity: true   # close remaining at BSL/SSL; fallback_r used if no pool found
 
 data:
-  htf_limit: 150    # 1H candles to fetch
-  ltf_limit: 100    # 5M candles to fetch
+  htf_limit: 200    # 4H candles to fetch (~33 days for POI detection)
+  ltf_limit: 150    # 1H candles to fetch (~6 days for sweep/CHoCH)
 
 signal_only_mode: true   # true = log signals, never execute orders; flip to false for demo execution
+
+# Session filter (Sprint 3) — London 08-15 UTC, NY 13-21 UTC
+# Untested on 4H+1H chain; kept from 1H+5M configuration. Register as new trial before enabling in production.
+session:
+  filter_enabled: false   # disabled until tested on 4H+1H chain
+  active_sessions: [London, "New York"]
 
 logging:
   file: logs/smc_bot.log

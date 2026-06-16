@@ -111,46 +111,85 @@ def price_in_poi(price: float, zones: list[dict]) -> dict | None:
     return None
 
 
+def ob_for_price(price: float, zones: list[dict]) -> dict | None:
+    """
+    Return the first OB zone containing price, or None.
+
+    Rule from diagrams: entry is at the Order Block, not at a standalone FVG.
+    FVG zones are skipped — FVG presence is checked separately as confluence
+    via has_fvg(). Only call this when you want the strict OB-at-entry rule.
+    """
+    for z in zones:
+        if z.get("kind") == "OB" and z["low"] <= price <= z["high"]:
+            return z
+    return None
+
+
+def has_fvg(zones: list[dict]) -> bool:
+    """Return True if any FVG zone is present in the list (confluence check)."""
+    return any(z.get("kind") == "FVG" for z in zones)
+
+
 def filter_fresh_zones(
     zones: list[dict],
     df: pd.DataFrame,
     bias: str,
+    consume_pct: float = 0.5,
+    mode: str = "wick",
 ) -> list[dict]:
     """
-    Remove mitigated zones — Trial 6 mitigation filter.
+    Remove mitigated zones.
 
-    A zone is mitigated when price trades through at least its midpoint (50%)
-    on any completed bar after the zone's creation_bar.
+    consume_pct: depth from entry edge before zone is considered consumed.
+      0.5  = midpoint  |  0.75 = 75%  |  1.0 = fully consumed
 
-    Bullish zones: mitigated if any subsequent bar's low  ≤ midpoint.
-    Bearish zones: mitigated if any subsequent bar's high ≥ midpoint.
+    mode: which price level to compare against the threshold.
+      "wick"  = low[k]/high[k] (Trial 9 baseline — aggressive at 4H)
+      "close" = close[k] for both directions (Trial 10 — less aggressive)
 
-    Zones without a 'creation_bar' key are passed through unchanged so callers
-    that pre-date this filter are not broken.
+    Threshold:
+      bullish: zone.high − consume_pct × range  (mitigated when price ≤ threshold)
+      bearish: zone.low  + consume_pct × range  (mitigated when price ≥ threshold)
+
+    Zones without 'creation_bar' pass through unchanged (backward compat).
     """
     if not zones:
         return zones
 
-    high = df["high"].values
-    low  = df["low"].values
-    n    = len(df)
+    high  = df["high"].values
+    low   = df["low"].values
+    close = df["close"].values
+    n     = len(df)
     fresh: list[dict] = []
     rejected = 0
+    use_close = (mode == "close")
 
     for z in zones:
         if "creation_bar" not in z:
             fresh.append(z)
             continue
-        mid = (z["low"] + z["high"]) / 2.0
+        zone_range = z["high"] - z["low"]
+        if bias == "bullish":
+            threshold = z["high"] - consume_pct * zone_range
+        else:
+            threshold = z["low"]  + consume_pct * zone_range
         cb  = z["creation_bar"]
         mitigated = False
         for k in range(cb + 1, n):
-            if bias == "bullish" and low[k] <= mid:
-                mitigated = True
-                break
-            if bias == "bearish" and high[k] >= mid:
-                mitigated = True
-                break
+            if use_close:
+                if bias == "bullish" and close[k] <= threshold:
+                    mitigated = True
+                    break
+                if bias == "bearish" and close[k] >= threshold:
+                    mitigated = True
+                    break
+            else:
+                if bias == "bullish" and low[k] <= threshold:
+                    mitigated = True
+                    break
+                if bias == "bearish" and high[k] >= threshold:
+                    mitigated = True
+                    break
         if mitigated:
             rejected += 1
         else:
@@ -158,8 +197,8 @@ def filter_fresh_zones(
 
     if rejected:
         log.debug(
-            "Mitigation filter (%s): %d zones → %d fresh, %d rejected",
-            bias, len(zones), len(fresh), rejected,
+            "Mitigation filter (%s, pct=%.0f%%, mode=%s): %d zones → %d fresh, %d rejected",
+            bias, consume_pct * 100, mode, len(zones), len(fresh), rejected,
         )
     return fresh
 

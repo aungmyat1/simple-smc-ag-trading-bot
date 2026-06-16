@@ -321,6 +321,20 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         )
         return
 
+    # Sprint 3: kill zone session filter — London 08-15 UTC, NY 13-21 UTC
+    sc = cfg.get("session", {})
+    if sc.get("filter_enabled", False):
+        h = datetime.now(timezone.utc).hour
+        in_london = 8 <= h <= 15
+        in_ny     = 13 <= h <= 21
+        if not (in_london or in_ny):
+            log.info("Kill zone filter: hour=%02d UTC not in London/NY — skip", h)
+            return
+        session_name = "London" if in_london else "New York"
+        if in_london and in_ny:
+            session_name = "London/NY overlap"
+        log.info("Kill zone active: %s (hour=%02d UTC)", session_name, h)
+
     # ── STEP 4: Mark 1H OB/FVG demand (bullish) / supply (bearish) zones ─────
     pois = poi.get_pois(
         df_1h,
@@ -348,12 +362,19 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     tgt_min_r     = tc.get("min_r", 1.5)
     tgt_fallback  = tc.get("fallback_r", 2.0)
 
-    # ── STEP 6: Wait for price to tap POI ────────────────────────────────────
+    # ── STEP 6: Wait for price to tap a valid POI (OB required; FVG = confluence)
+    # Diagrams: entry zone is "OB + FVG" — OB is the primary entry level.
+    # FVG-only taps are not valid entries; both zones must exist in the POI list.
     active = poi.price_in_poi(price, pois)
     if active is None:
-        log.info("Price %.2f not yet in any %s POI", price, bias)
+        log.info("Price %.2f not in any 4H OB/FVG zone", price)
         return
-    log.info("Price in 1H %s POI [%.2f – %.2f]", active["kind"], active["low"], active["high"])
+    fvg_ok = poi.has_fvg(pois)
+    log.info(
+        "Price in 4H %s [%.2f – %.2f] | FVG present: %s",
+        active.get("kind", "zone"), active["low"], active["high"],
+        "YES" if fvg_ok else "no",
+    )
 
     # ── STEP 7-8: 5M sweep ───────────────────────────────────────────────────
     lc = cfg["liquidity"]
@@ -390,30 +411,34 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         return
     log.info("CHoCH confirmed (%s)", bias)
 
-    # ── STEPS 11-12: Mark 5M OB/FVG → enter on RETRACE into that zone ────────
-    # After CHoCH, identify the 5M OB/FVG formed by the displacement candle.
-    # Only enter when price RETRACES into that zone (limit-level, not market).
+    # ── STEPS 11-12: 5M OB/FVG — retrace into OB after CHoCH ────────────────
+    # Diagrams (both bullish and bearish): after CHoCH the entry is at the OB
+    # zone formed by the displacement (with FVG above/overlapping as confluence).
+    # Rule: price must retrace into the 5M OB specifically. FVG-only retraces
+    # are not valid entries per the diagram rule.
     ltf_zones = poi.get_ltf_pois(
         df_5m, bias, sweep["bar_idx"],
         displacement_atr = disp_atr,
         lookback         = lc.get("ltf_poi_lookback", 15),
     )
+    ltf_entry_zone = None
     if ltf_zones:
-        ltf_entry_zone = poi.price_in_poi(price, ltf_zones)
+        ltf_entry_zone = poi.ob_for_price(price, ltf_zones)
+        ltf_fvg_ok = poi.has_fvg(ltf_zones)
         if ltf_entry_zone is None:
             log.info(
-                "CHoCH confirmed but price %.2f not yet in 5M OB/FVG — waiting for retrace",
-                price,
+                "CHoCH confirmed but price %.2f not in 5M OB — waiting for OB retrace "
+                "(5M FVG present: %s)",
+                price, ltf_fvg_ok,
             )
             return
         log.info(
-            "Price in 5M %s zone [%.2f – %.2f] — entry triggered",
-            ltf_entry_zone["kind"], ltf_entry_zone["low"], ltf_entry_zone["high"],
+            "Price in 5M OB [%.2f – %.2f] | FVG confluence: %s — entry triggered",
+            ltf_entry_zone["low"], ltf_entry_zone["high"],
+            "YES" if ltf_fvg_ok else "NO",
         )
     else:
-        # No 5M OB/FVG detected (can happen on very fast moves); enter at market.
-        ltf_entry_zone = None
-        log.info("No 5M OB/FVG found; proceeding to market entry")
+        log.info("No 5M OB/FVG detected (fast move); proceeding to market entry")
 
     # ── STEP 13: SL below/above sweep wick ───────────────────────────────────
     buf = rc["sl_buffer"]
