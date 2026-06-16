@@ -184,3 +184,30 @@ Options after Trials 11–12:
 | 4 | **5M OB retrace window expansion** | After CHoCH, lookback for 5M OB is 15 bars. Extending to 30–45 bars may capture more retraces. | Larger lookback → staler OBs; risk of overlap with new signals. |
 
 **Owner decides next trial. Log the exact config here before running. Never tune a failing trial — always register a new one.**
+
+---
+
+## Research Note — videoplayback__1_.mp4 (2026-06-16)
+
+**Source:** `videoplayback__1_.mp4` — ~36 min SMC lesson (TradingView screen-recording).
+**Converted via:** `VIDEO_SMC_ENTRY_MODELS_SPEC.md` → `docs/research/VIDEO_ENTRY_MODELS.md`
+
+**Finding:** The video teaches three entry models:
+- **Model 1 (Displacement Trap)** = current confirmation entry (`structure → poi → liquidity → confirmation`). Already live and validated — Trial 21 Phase-0 PASS.
+- **Model 2 (Refined OB limit / BASIL)** = NOT yet validated. Limit entry at a refined 5M OB inside the HTF OB, scored by BASIL checklist (Break of structure · Alignment · Sweep · Imbalance · Last candle). Requires own trial.
+- **Model 3 (Breaker Block)** = NOT yet validated. Failed/violated OB flips polarity; enter on retest in new direction. Requires own trial + `poi.py` change to re-polarise violated zones.
+
+**Session-timing bonus:** Video shows London/NY filter — NOT applicable to BTC (24/7 asset). Sprint 3 / Trial 17 confirmed session filter hurts BTC edge (net PF 0.34). `session.filter_enabled` remains `false`.
+
+**[NEEDS-TRANSCRIPT]** All spoken SL/RR/score-threshold rules are unverifiable without audio transcript. Do not hard-code them.
+
+**Stub created:** `smc_bot/entry_modes.py` (proposal-only, NotImplementedError, no executor/pybit imports).
+
+---
+
+## PENDING Trials — Video Entry Models
+
+| Trial | Date | Signal | TF | n | Gross PF | Avg fee (R) | Net PF | Win% | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| V2 | PENDING | **Refined OB limit (BASIL)**: 4H+1H chain. HTF OB identified → drill to 1H refined OB inside it → BASIL score ≥ 3/5 → **limit entry** at refined OB top/bottom. SL below refined OB. [NEEDS-TRANSCRIPT] exact SL/RR/threshold. 5yr holdout (same as Trial 21). Gate: n≥50 AND gross PF>1.0. | 4H+1H | — | — | — | — | — | **PENDING** — requires `smc_bot/entry_modes.py::refined_ob_entry()` implementation + separate backtest trial. Do NOT merge PnL with Trial 21 (Model 1). |
+| V3 | PENDING | **Breaker Block**: 4H+1H chain. Identify violated OBs (price closed strongly through zone) → flip polarity → enter on retest of breaker in new direction. [NEEDS-TRANSCRIPT] "strongly closes through" threshold, lookback, SL/RR. Requires `poi.py` change to re-polarise violated zones. 5yr holdout. Gate: n≥50 AND gross PF>1.0. | 4H+1H | — | — | — | — | — | **PENDING** — requires `smc_bot/entry_modes.py::breaker_entry()` implementation + `poi.py` breaker detection + separate backtest trial. Do NOT merge PnL with Trial 21 or V2. |
