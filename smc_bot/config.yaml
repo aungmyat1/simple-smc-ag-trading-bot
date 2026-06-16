@@ -33,20 +33,9 @@ liquidity:
   swing_n: 3        # bars each side for 5M swing detection
   lookback: 30      # how many 5M bars to scan for prior swing levels
   displacement_atr: 1.5   # post-sweep displacement gate: candle must be >= N × ATR
-  ltf_poi_lookback: 15    # bars after sweep to scan for 5M entry OB/FVG
 
 confirmation:
   lookback: 10      # bars before sweep to establish the CHoCH reference level
-
-targets:
-  equal_level_tolerance: 0.002   # 0.2% — swing highs/lows within this % form a cluster
-  min_r: 1.5                     # BSL/SSL cluster must be >= N×R away; else skip (use 2R fallback)
-  fallback_r: 2.0                # fixed-R fallback when no liquidity pool qualifies
-
-partials:
-  tp1_r: 1.0          # close tp1_pct of position at 1R (move SL to BE)
-  tp1_pct: 0.50       # 50% off at TP1
-  tp2_at_liquidity: true   # close remaining at BSL/SSL; fallback_r used if no pool found
 
 data:
   htf_limit: 150    # 1H candles to fetch
