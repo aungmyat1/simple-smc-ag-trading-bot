@@ -1,20 +1,21 @@
 """
-entry_modes.py — PROPOSE-ONLY stub for SMC entry model candidates.
+entry_modes.py — PROPOSE-ONLY entry model implementations and legacy stubs.
 
-Three entry models from VIDEO_SMC_ENTRY_MODELS_SPEC.md / docs/research/VIDEO_ENTRY_MODELS.md:
-  Model 1: Displacement Trap (confirmation) — LIVE in bot.py / backtest.py (Trial 21 PASS)
-  Model 2: Refined OB Limit (BASIL scoring) — PENDING trial, not wired
-  Model 3: Breaker Block                    — PENDING trial, not wired
+Section A: Working implementations (displacement_trap / refined_ob / breaker)
+  Used by signal.py's generate_signal(). No executor imports.
+
+Section B: Legacy stubs (confirmation_entry / refined_ob_entry / breaker_entry)
+  Raise NotImplementedError. Retained for test_ast_guard compatibility.
 
 RULES:
   - This file must NOT import executor, pybit, ccxt, or any exchange SDK.
-  - Do NOT call these from bot.py or backtest.py until each passes its own
-    gross-PF > 1.0 holdout trial and is approved in VERDICT_LOG.md.
-  - [NEEDS-TRANSCRIPT] items (SL, RR, BASIL threshold) must not be hard-coded
-    until the video transcript is provided and rules are explicitly cited.
+  - Stub functions (Section B) are documentation only — do not call them.
+  - Working implementations (Section A) are wired to signal.generate_signal().
+    Each EXPERIMENTAL mode still needs its own gross-PF > 1.0 holdout trial.
 """
-
 from __future__ import annotations
+
+import pandas as pd
 
 
 # ---------------------------------------------------------------------------
@@ -129,3 +130,91 @@ def breaker_entry(
         "Requires poi.py change to re-polarise violated OBs, plus its own "
         "backtest trial logged in VERDICT_LOG.md before activation."
     )
+
+
+# ---------------------------------------------------------------------------
+# Section A — Working implementations (signal.py seam — PROPOSE-ONLY)
+# Each returns an EntryProposal(entry, stop, kind, mode) or None.
+# ---------------------------------------------------------------------------
+
+
+class EntryProposal:
+    __slots__ = ("entry", "stop", "kind", "mode")
+
+    def __init__(self, entry: float, stop: float, kind: str, mode: str) -> None:
+        self.entry = entry
+        self.stop = stop
+        self.kind = kind    # "market" | "limit"
+        self.mode = mode    # which model fired
+
+
+def displacement_trap(
+    price: float,
+    sweep: dict,
+    bias: str,
+    buffer: float,
+) -> EntryProposal | None:
+    """Model 1 — market entry at CHoCH price, SL beyond sweep wick."""
+    if sweep is None:
+        return None
+    wick = sweep["wick_extreme"]
+    if bias == "bullish":
+        return EntryProposal(price, wick * (1 - buffer), "market", "displacement_trap")
+    return EntryProposal(price, wick * (1 + buffer), "market", "displacement_trap")
+
+
+def refined_ob(
+    active_poi: dict | None,
+    bias: str,
+    buffer: float,
+) -> EntryProposal | None:
+    """Model 2 — limit entry at POI midpoint, SL beyond POI boundary. EXPERIMENTAL."""
+    if active_poi is None:
+        return None
+    lo, hi = active_poi["low"], active_poi["high"]
+    mid = (lo + hi) / 2.0
+    if bias == "bullish":
+        return EntryProposal(mid, lo * (1 - buffer), "limit", "refined_ob")
+    return EntryProposal(mid, hi * (1 + buffer), "limit", "refined_ob")
+
+
+def breaker(
+    df_1h: pd.DataFrame,
+    bias: str,
+    buffer: float,
+    lookback: int = 60,
+) -> EntryProposal | None:
+    """
+    Model 3 — limit at a flipped (violated) OB boundary. EXPERIMENTAL.
+    Returns None unless a clean violation+flip is found in the lookback window.
+    """
+    o, h, l, c = (df_1h[x].values for x in ("open", "high", "low", "close"))
+    n = len(df_1h)
+    start = max(1, n - lookback)
+    if bias == "bullish":
+        for i in range(start, n - 1):
+            if c[i] < o[i]:
+                top = h[i]
+                broke = any(c[j] > top for j in range(i + 1, n))
+                if broke and l[-1] <= top:
+                    return EntryProposal(top, l[i] * (1 - buffer), "limit", "breaker")
+    else:
+        for i in range(start, n - 1):
+            if c[i] > o[i]:
+                bot = l[i]
+                broke = any(c[j] < bot for j in range(i + 1, n))
+                if broke and h[-1] >= bot:
+                    return EntryProposal(bot, h[i] * (1 + buffer), "limit", "breaker")
+    return None
+
+
+MODES = {
+    "displacement_trap": "Model 1 — confirmation entry (live default)",
+    "refined_ob":        "Model 2 — refined OB limit (EXPERIMENTAL)",
+    "breaker":           "Model 3 — breaker block (EXPERIMENTAL)",
+}
+
+
+# ---------------------------------------------------------------------------
+# Section B — Legacy stubs (raise NotImplementedError; kept for test compat)
+# ---------------------------------------------------------------------------

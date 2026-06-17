@@ -87,6 +87,14 @@ TP1_PCT = _CFG.get("partials", {}).get("tp1_pct", 0.50)  # Sprint 2: fraction cl
 # When False (default), only OB zones are valid entry triggers (Trial 11 rule).
 FVG_ENTRIES: bool = False
 
+# Trial 23: skip if 1H LTF structural bias explicitly opposes 4H HTF bias.
+# Neutral 1H still passes. Set by --h1-bias-filter at runtime.
+H1_BIAS_FILTER: bool = False
+
+# Trial 24: minimum fractional distance from fib equilibrium midpoint.
+# 0.0 = disabled; 0.01 = require ≥1% from midpoint. Set by --fib-dist-min at runtime.
+FIB_DIST_MIN: float = 0.0
+
 TAKER_FEE  = 0.0006   # Bybit taker 0.06%/side (not in config.yaml — exchange constant)
 ROUND_TRIP = TAKER_FEE * 2
 
@@ -140,6 +148,10 @@ _HTF4_MAP: np.ndarray | None = None   # 5M index → 4H iloc
 # Sprint 3: UTC hour for each 5M bar (precomputed for kill-zone filter)
 _HOUR_5M: np.ndarray | None = None
 
+# Trial 23: LTF structure swing arrays (SWING_N, not LIQ_SN) for H1_BIAS_FILTER
+_SH_LTF_STR: list[int] = []
+_SL_LTF_STR: list[int] = []
+
 
 def _swing_lows_np(low: np.ndarray, n: int) -> list[int]:
     """Same logic as smc_bot/structure._swing_lows and smc_bot/liquidity._swing_lows."""
@@ -175,7 +187,7 @@ def _atr14_series(df: pd.DataFrame) -> np.ndarray:
 def _precompute(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> None:
     global _H_1H, _L_1H, _O_1H, _C_1H, _SH_1H, _SL_1H, _ATR14_1H
     global _H_5M, _L_5M, _C_5M, _O_5M, _SL_5M, _SH_5M, _ATR14_5M
-    global _HOUR_5M
+    global _HOUR_5M, _SH_LTF_STR, _SL_LTF_STR
 
     print("  Precomputing 1H swings + ATR14 …", flush=True)
     _H_1H = df_1h["high"].values
@@ -200,6 +212,10 @@ def _precompute(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> None:
         _HOUR_5M = pd.to_datetime(df_5m["ts"]).dt.hour.values.astype(np.int8)
     else:
         _HOUR_5M = None
+
+    # Trial 23: LTF structure swings (SWING_N, not LIQ_SN) for H1_BIAS_FILTER
+    _SH_LTF_STR = _swing_highs_np(_H_5M, SWING_N)
+    _SL_LTF_STR = _swing_lows_np(_L_5M,  SWING_N)
 
 
 def _precompute_4h(df_4h: pd.DataFrame, df_5m: pd.DataFrame) -> None:
@@ -260,6 +276,30 @@ def _fast_bias_4h(htf4_idx: int) -> str:
     hl = _L_4H[_SL_4H[sl_end - 1]] > _L_4H[_SL_4H[sl_end - 2]]
     lh = _H_4H[_SH_4H[sh_end - 1]] < _H_4H[_SH_4H[sh_end - 2]]
     ll = _L_4H[_SL_4H[sl_end - 1]] < _L_4H[_SL_4H[sl_end - 2]]
+    if hh and hl:
+        return "bullish"
+    if lh and ll:
+        return "bearish"
+    return "neutral"
+
+
+def _fast_bias_ltf(ltf_bar: int) -> str:
+    """
+    Trial 23 — structural bias of the LTF (1H when running 4H+1H) at ltf_bar.
+
+    Uses _SH_LTF_STR/_SL_LTF_STR (precomputed with SWING_N, not LIQ_SN) so swing
+    definitions match structure.get_bias() rather than the liquidity sweep detector.
+    Returns "bullish" | "bearish" | "neutral".
+    """
+    max_conf = ltf_bar - SWING_N
+    sh_end   = bisect.bisect_right(_SH_LTF_STR, max_conf)
+    sl_end   = bisect.bisect_right(_SL_LTF_STR, max_conf)
+    if sh_end < 2 or sl_end < 2:
+        return "neutral"
+    hh = _H_5M[_SH_LTF_STR[sh_end - 1]] > _H_5M[_SH_LTF_STR[sh_end - 2]]
+    hl = _L_5M[_SL_LTF_STR[sl_end - 1]] > _L_5M[_SL_LTF_STR[sl_end - 2]]
+    lh = _H_5M[_SH_LTF_STR[sh_end - 1]] < _H_5M[_SH_LTF_STR[sh_end - 2]]
+    ll = _L_5M[_SL_LTF_STR[sl_end - 1]] < _L_5M[_SL_LTF_STR[sl_end - 2]]
     if hh and hl:
         return "bullish"
     if lh and ll:
@@ -501,6 +541,8 @@ def _fast_fib_filter(htf_idx: int, price: float, bias: str) -> bool:
     if sh_end < 1 or sl_end < 1:
         return False   # not enough swing history → skip (conservative)
     mid = (_H_1H[_SH_1H[sh_end - 1]] + _L_1H[_SL_1H[sl_end - 1]]) / 2.0
+    if FIB_DIST_MIN > 0.0 and abs(price - mid) / mid < FIB_DIST_MIN:
+        return False
     if bias == "bullish":
         return bool(price <= mid)
     if bias == "bearish":
@@ -710,6 +752,10 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
             if not _fast_choch(sweep, i):
                 continue
 
+            # Trial 23: skip if LTF structural bias is explicitly bearish (counter to HTF)
+            if H1_BIAS_FILTER and _fast_bias_ltf(i) == "bearish":
+                continue
+
             # Sprint 4: require 5M BOS close after CHoCH
             if BOS_CONFIRM:
                 bos_bar = _fast_bos(i, bias)
@@ -762,6 +808,10 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
             if not _fast_displacement(sweep["bar_idx"], i, bias):
                 continue
             if not _fast_choch_short(sweep, i):
+                continue
+
+            # Trial 23: skip if LTF structural bias is explicitly bullish (counter to HTF)
+            if H1_BIAS_FILTER and _fast_bias_ltf(i) == "bullish":
                 continue
 
             # Sprint 4: require 5M BOS close after CHoCH
@@ -1158,6 +1208,7 @@ def save_trades_csv(stats: dict, path: str) -> None:
 def main() -> None:
     global MITIGATION_PCT, MITIGATION_MODE, BSLSSL_TP, TGT_MIN_RR
     global MACRO_BIAS, PARTIAL_TP, SESSION_FILTER, BOS_CONFIRM, FVG_ENTRIES
+    global H1_BIAS_FILTER, FIB_DIST_MIN
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--htf", default=str(ROOT / "data" / "cache" / f"{SYMBOL}_60m.parquet"))
@@ -1227,6 +1278,20 @@ def main() -> None:
             "Applies to 4H+1H chain where FVG entries were ~50%% of signals at equal PF."
         ),
     )
+    parser.add_argument(
+        "--h1-bias-filter", action="store_true",
+        help=(
+            "Trial 23: skip entry if LTF structural bias (HH+HL / LL+LH, SWING_N) "
+            "is explicitly counter to HTF bias. Neutral LTF still passes."
+        ),
+    )
+    parser.add_argument(
+        "--fib-dist-min", type=float, default=0.0,
+        help=(
+            "Trial 24: minimum fractional distance from fib equilibrium midpoint "
+            "(e.g. 0.01 = require ≥1%% from mid). 0.0 = disabled (default)."
+        ),
+    )
     args = parser.parse_args()
 
     for label, path in [("HTF (1H)", args.htf), ("LTF (5M)", args.ltf)]:
@@ -1266,6 +1331,8 @@ def main() -> None:
     SESSION_FILTER = args.session_filter
     BOS_CONFIRM    = args.bos_confirm
     FVG_ENTRIES    = args.fvg_entries
+    H1_BIAS_FILTER = args.h1_bias_filter
+    FIB_DIST_MIN   = args.fib_dist_min
 
     def _tf_label(path: str) -> str:
         stem = Path(path).stem.rsplit("_", 1)
