@@ -61,6 +61,19 @@ session:
   filter_enabled: false   # disabled until tested on 4H+1H chain
   active_sessions: [London, "New York"]
 
+  # Asian session box (P1 — PENDING Phase-0 gate, not yet wired into bot.py)
+  # Each setup mode (sweep / range / trend) requires its own gross-PF > 1.0 trial.
+  asian:
+    start_h:             0      # session window start (UTC hour, inclusive)
+    end_h:               8      # session window end   (UTC hour, exclusive)
+    range_thr:           0.5    # box.range/ATR < range_thr  → 'range' session
+    trend_thr:           0.7    # box.range/ATR > trend_thr  → 'trend' session
+    sweep_beyond_pct:    0.02   # wick must pierce extreme by 2% of box range
+    sl_pct_of_range:     0.25   # SL = entry ± 25% of box range
+    target_r:            5.0    # runner / final TP (5R or BSL/SSL pool)
+    trend_first_close_r: 4.0    # trend setup: first partial close at 4R
+    first_close_pct:     0.75   # close 75% of position at first_close target
+
 logging:
   file: logs/smc_bot.log
   level: INFO

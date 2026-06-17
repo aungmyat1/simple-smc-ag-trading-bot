@@ -93,3 +93,20 @@ def test_entry_modes_raises_not_implemented():
         mod.refined_ob_entry("bullish", 50000.0, {}, [])
     with pytest.raises(NotImplementedError):
         mod.breaker_entry("bullish", 50000.0, [])
+
+
+# ---------------------------------------------------------------------------
+# PROPOSE-ONLY guard — session_range.py
+# ---------------------------------------------------------------------------
+
+_FORBIDDEN_IN_SESSION_RANGE = {"executor", "pybit", "ccxt", "pybybit", "bybit"}
+
+
+def test_session_range_does_not_import_exchange_sdk():
+    """session_range.py is propose-only: must never import executor or exchange SDKs."""
+    src = (ROOT / "smc_bot" / "session_range.py").read_text()
+    imported = _collect_imports(src)
+    violations = [n for n in imported if any(f in n for f in _FORBIDDEN_IN_SESSION_RANGE)]
+    assert violations == [], (
+        f"session_range.py must not import exchange SDKs (propose-only): {violations}"
+    )
