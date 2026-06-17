@@ -45,7 +45,7 @@ import yaml
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from smc_bot import poi, targets as tgt_mod  # noqa: E402
+from smc_bot import poi, targets as tgt_mod, session_range as sr  # noqa: E402
 
 # ── Config (smc_bot/config.yaml — single source of truth) ────────────────────
 
@@ -626,30 +626,37 @@ def _scan_exit_partial(
     tp1: float,
     tp_full: float,
     tp_full_r: float,
+    tp1_pct: float | None = None,
+    tp1_r_actual: float | None = None,
 ) -> tuple[float, str, int]:
     """
     Sprint 2 — two-leg partial TP exit for longs.
 
     Leg 1 (full size): scan for SL or TP1.
       SL hit  → gross_r = -1.0
-      TP1 hit → close TP1_PCT at TP1_R, move SL to entry_price (break-even)
-    Leg 2 (remaining 1-TP1_PCT): scan from TP1 bar for BE or tp_full.
-      BE hit      → gross_r = TP1_PCT×TP1_R + (1-TP1_PCT)×0.0
-      tp_full hit → gross_r = TP1_PCT×TP1_R + (1-TP1_PCT)×tp_full_r
+      TP1 hit → close tp1_pct at tp1_r_actual, move SL to entry_price (break-even)
+    Leg 2 (remaining 1-tp1_pct): scan from TP1 bar for BE or tp_full.
+      BE hit      → gross_r = tp1_pct×tp1_r + (1-tp1_pct)×0.0
+      tp_full hit → gross_r = tp1_pct×tp1_r + (1-tp1_pct)×tp_full_r
       EOD         → treat as BE
+
+    tp1_pct, tp1_r_actual: per-call overrides for TP1_PCT / TP1_R globals.
+      Used by --signal asian_session to pass the actual first-close R per trade.
     """
+    _pct = tp1_pct      if tp1_pct      is not None else TP1_PCT
+    _r   = tp1_r_actual if tp1_r_actual is not None else TP1_R
     for k in range(entry_bar, len(high)):
         if low[k] <= sl:
             return -1.0, "SL", k
         if high[k] >= tp1:
             for k2 in range(k, len(high)):
                 if low[k2] <= entry_price:
-                    gross = TP1_PCT * TP1_R + (1.0 - TP1_PCT) * 0.0
+                    gross = _pct * _r + (1.0 - _pct) * 0.0
                     return gross, "TP1+BE", k2
                 if high[k2] >= tp_full:
-                    gross = TP1_PCT * TP1_R + (1.0 - TP1_PCT) * tp_full_r
+                    gross = _pct * _r + (1.0 - _pct) * tp_full_r
                     return gross, "TP1+TP", k2
-            gross = TP1_PCT * TP1_R + (1.0 - TP1_PCT) * 0.0
+            gross = _pct * _r + (1.0 - _pct) * 0.0
             return gross, "TP1+EOD", len(high) - 1
     return -1.0, "EOD-SL", len(high) - 1
 
@@ -663,22 +670,267 @@ def _scan_exit_partial_short(
     tp1: float,
     tp_full: float,
     tp_full_r: float,
+    tp1_pct: float | None = None,
+    tp1_r_actual: float | None = None,
 ) -> tuple[float, str, int]:
-    """Sprint 2 — two-leg partial TP exit for shorts (mirror of long version)."""
+    """Sprint 2 — two-leg partial TP exit for shorts (mirror of long version).
+
+    tp1_pct, tp1_r_actual: per-call overrides for TP1_PCT / TP1_R globals.
+    """
+    _pct = tp1_pct      if tp1_pct      is not None else TP1_PCT
+    _r   = tp1_r_actual if tp1_r_actual is not None else TP1_R
     for k in range(entry_bar, len(high)):
         if high[k] >= sl:
             return -1.0, "SL", k
         if low[k] <= tp1:
             for k2 in range(k, len(high)):
                 if high[k2] >= entry_price:
-                    gross = TP1_PCT * TP1_R + (1.0 - TP1_PCT) * 0.0
+                    gross = _pct * _r + (1.0 - _pct) * 0.0
                     return gross, "TP1+BE", k2
                 if low[k2] <= tp_full:
-                    gross = TP1_PCT * TP1_R + (1.0 - TP1_PCT) * tp_full_r
+                    gross = _pct * _r + (1.0 - _pct) * tp_full_r
                     return gross, "TP1+TP", k2
-            gross = TP1_PCT * TP1_R + (1.0 - TP1_PCT) * 0.0
+            gross = _pct * _r + (1.0 - _pct) * 0.0
             return gross, "TP1+EOD", len(high) - 1
     return -1.0, "EOD-SL", len(high) - 1
+
+
+# ── Asian session backtest ────────────────────────────────────────────────────
+
+def run_backtest_asian(
+    df_4h: pd.DataFrame, df_1h: pd.DataFrame,
+    side: str = "both", setup_filter: str = "all",
+) -> dict:
+    """
+    Bar-by-bar Asian session signal backtest on 1H data.
+
+    df_4h: 4H OHLCV — macro bias (HTF; in main() this is the --htf parquet).
+    df_1h: 1H OHLCV — box / ATR / sweep / exit simulation (LTF; --ltf parquet).
+
+    Signal fires once per session at the first 1H bar after the Asian window closes
+    (bar.hour == session.asian.end_h, typically 08 UTC).  No-lookahead: only
+    df slices up to bar i are passed to build_session_signal.
+
+    Fill model:
+      SWEEP  — market fill at the 09:00 UTC open (setup resolved inside the Asian
+               session; at 08:00 we know the result, so entering at market is correct).
+      RANGE  — limit order at sig.entry (box edge).
+      TREND  — limit order at sig.entry (box midpoint).
+      Cancel rule for RANGE/TREND: cancel at the next 00:00 UTC bar (start of the
+      following Asian session).  One non-overlapping attempt per session.
+      No-fills are counted per setup; a cancelled order does not block subsequent sessions.
+
+    Exit model — two-leg partial using _scan_exit_partial:
+      75% close at first_close target:
+        sweep/range → opposite box edge (≈ 4R when stop = 25% of box range)
+        trend       → tp_plan.tp1       (4R from signal entry)
+      25% runner: SL moves to entry (break-even, 0R); exits at 5R or BE.
+    Trailing rule: SL → entry (0R) after first partial close.  Conservative for
+    Phase-0; a proper ATR trail becomes a new trial if the signal passes the gate.
+
+    _scan_exit_partial is called from fill_bar (not entry_bar) so that the
+    intrabar SL-vs-limit race on the fill candle is handled conservatively (SL
+    check comes first inside the scanner).
+
+    Arrays: _H_5M/_L_5M/_O_5M hold 1H data when populated by
+    _precompute(df_4h, df_1h) from main() with --ltf pointing at the 1H parquet.
+    """
+    ac              = _CFG.get("session", {}).get("asian", {})
+    end_h           = int(ac.get("end_h", 8))
+    first_close_pct = float(ac.get("first_close_pct", 0.75))
+
+    # _precompute(df_4h, df_1h) stores LTF (1H) arrays in the _5M-named globals
+    high_1h = _H_5M   # _H_5M = df_1h["high"].values when called with 1H LTF
+    low_1h  = _L_5M
+    open_1h = _O_5M
+
+    htf_map  = _align_htf(df_4h, df_1h)   # each 1H bar → last complete 4H bar iloc
+    hours_1h = pd.to_datetime(df_1h["ts"]).dt.hour.values
+
+    trades:   list[dict]     = []
+    no_fills: dict[str, int] = {}   # setup → cancelled limit orders (RANGE/TREND only)
+    skip_until = 0
+    warmup     = max(50, HTF_WARMUP)   # need ≥50 4H bars + a few completed Asian sessions
+
+    for i in range(warmup, len(df_1h) - 1):
+        if i < skip_until:
+            continue
+
+        # Signal only at the first post-Asian bar (08:00 UTC)
+        if hours_1h[i] != end_h:
+            continue
+
+        htf_idx = int(htf_map[i])
+        if htf_idx < 0:
+            continue
+
+        now_utc     = pd.to_datetime(df_1h["ts"].iloc[i], utc=True)
+        df_4h_slice = df_4h.iloc[: htf_idx + 1]
+        df_1h_slice = df_1h.iloc[: i + 1]
+
+        sig = sr.build_session_signal(df_4h_slice, df_1h_slice, _CFG, now_utc=now_utc)
+        if sig is None:
+            continue
+
+        if side == "long"  and sig.side != "Buy":
+            continue
+        if side == "short" and sig.side != "Sell":
+            continue
+        if setup_filter != "all" and sig.setup != setup_filter:
+            continue
+
+        # bullish derived from sig.side (not a stale outer variable)
+        bullish   = sig.side == "Buy"
+        entry_bar = i + 1
+        if entry_bar >= len(df_1h):
+            continue
+
+        # ── Fill model ────────────────────────────────────────────────────────
+        if sig.setup == "sweep":
+            # Market fill: sweep resolved before 08:00; enter at 09:00 open.
+            fill_bar    = entry_bar
+            entry_price = float(open_1h[fill_bar])
+        else:
+            # Limit fill at sig.entry.
+            # Cancel rule: first 00:00 UTC bar after the signal (= next Asian box start).
+            cancel_bar = len(df_1h)   # default: end of data
+            for j in range(entry_bar, len(df_1h)):
+                if hours_1h[j] == 0:
+                    cancel_bar = j
+                    break
+
+            limit    = float(sig.entry)
+            fill_bar = None
+            for k in range(entry_bar, cancel_bar):
+                if bullish     and low_1h[k]  <= limit:
+                    fill_bar = k
+                    break
+                if not bullish and high_1h[k] >= limit:
+                    fill_bar = k
+                    break
+
+            if fill_bar is None:
+                # Limit never reached — order cancelled; count and move on.
+                no_fills[sig.setup] = no_fills.get(sig.setup, 0) + 1
+                continue
+
+            entry_price = limit   # filled at the limit price
+
+        # ── Risk geometry ─────────────────────────────────────────────────────
+        sl             = float(sig.sl)
+        tp_full        = float(sig.tp)
+        first_close_at = float(sig.mgmt["first_close_at"])
+
+        stop_dist = abs(entry_price - sl)
+        if stop_dist <= 0:
+            continue
+
+        if bullish:
+            first_close_r = (first_close_at - entry_price) / stop_dist
+            tp_full_r     = (tp_full - entry_price) / stop_dist
+        else:
+            first_close_r = (entry_price - first_close_at) / stop_dist
+            tp_full_r     = (entry_price - tp_full) / stop_dist
+
+        # Guard: entry slipped past first-close or TP on wrong side of entry
+        if first_close_r <= 0 or tp_full_r <= 0:
+            continue
+
+        # ── Exit simulation ───────────────────────────────────────────────────
+        # Start from fill_bar so the SL-check on the fill candle handles the
+        # intrabar limit-vs-SL race conservatively (SL first in the scanner).
+        if bullish:
+            gross_r, exit_reason, exit_bar = _scan_exit_partial(
+                high_1h, low_1h, fill_bar, entry_price, sl,
+                tp1=first_close_at, tp_full=tp_full, tp_full_r=tp_full_r,
+                tp1_pct=first_close_pct, tp1_r_actual=first_close_r,
+            )
+        else:
+            gross_r, exit_reason, exit_bar = _scan_exit_partial_short(
+                high_1h, low_1h, fill_bar, entry_price, sl,
+                tp1=first_close_at, tp_full=tp_full, tp_full_r=tp_full_r,
+                tp1_pct=first_close_pct, tp1_r_actual=first_close_r,
+            )
+
+        fee_r = ROUND_TRIP * entry_price / stop_dist
+        net_r = gross_r - fee_r
+
+        trades.append({
+            "entry_bar":     fill_bar,
+            "exit_bar":      exit_bar,
+            "side":          "long" if bullish else "short",
+            "setup":         sig.setup,
+            "ts":            str(df_1h["ts"].iloc[i]),
+            "entry":         round(entry_price, 2),
+            "sl":            round(sl, 2),
+            "tp1":           round(first_close_at, 2),
+            "tp":            round(tp_full, 2),
+            "first_close_r": round(first_close_r, 4),
+            "tp_full_r":     round(tp_full_r, 4),
+            "gross_r":       round(gross_r, 4),
+            "fee_r":         round(fee_r, 4),
+            "net_r":         round(net_r, 4),
+            "reason":        exit_reason,
+        })
+        skip_until = exit_bar + 1
+
+    if not trades:
+        return {
+            "n": 0, "gross_pf": 0.0, "net_pf": 0.0,
+            "win_rate": 0.0, "avg_fee_r": 0.0, "max_dd_r": 0.0,
+            "expectancy": 0.0, "trades": [], "setup_stats": {}, "no_fills": no_fills,
+        }
+
+    gross_wins = sum(t["gross_r"] for t in trades if t["gross_r"] > 0)
+    gross_loss = abs(sum(t["gross_r"] for t in trades if t["gross_r"] <= 0))
+    net_wins   = sum(t["net_r"]   for t in trades if t["net_r"]   > 0)
+    net_loss   = abs(sum(t["net_r"]   for t in trades if t["net_r"]   <= 0))
+    wins       = sum(1 for t in trades if t["net_r"] > 0)
+
+    equity, peak, max_dd = 0.0, 0.0, 0.0
+    for t in trades:
+        equity += t["net_r"]
+        if equity > peak:
+            peak = equity
+        max_dd = max(max_dd, peak - equity)
+
+    n          = len(trades)
+    expectancy = sum(t["net_r"] for t in trades) / n
+
+    by_setup: dict[str, list] = {}
+    for t in trades:
+        by_setup.setdefault(t["setup"], []).append(t)
+
+    setup_stats: dict[str, dict] = {}
+    for sname, st in by_setup.items():
+        sn  = len(st)
+        sw  = sum(1 for t in st if t["net_r"] > 0)
+        sgw = sum(t["gross_r"] for t in st if t["gross_r"] > 0)
+        sgl = abs(sum(t["gross_r"] for t in st if t["gross_r"] <= 0))
+        nf  = no_fills.get(sname, 0)
+        setup_stats[sname] = {
+            "n":        sn,
+            "win_rate": round(sw / sn * 100, 1) if sn else 0.0,
+            "gross_pf": round(sgw / sgl, 4) if sgl else float("inf"),
+            "no_fills": nf,
+        }
+    # Surface setups that had signals but zero fills (visible in no_fills but not by_setup)
+    for sname, nf in no_fills.items():
+        if sname not in setup_stats:
+            setup_stats[sname] = {"n": 0, "win_rate": 0.0, "gross_pf": 0.0, "no_fills": nf}
+
+    return {
+        "n":           n,
+        "gross_pf":    round(gross_wins / gross_loss, 4) if gross_loss else float("inf"),
+        "net_pf":      round(net_wins   / net_loss,   4) if net_loss   else float("inf"),
+        "win_rate":    round(wins / n * 100, 2),
+        "avg_fee_r":   round(sum(t["fee_r"] for t in trades) / n, 4),
+        "expectancy":  round(expectancy, 4),
+        "max_dd_r":    round(max_dd, 4),
+        "trades":      trades,
+        "setup_stats": setup_stats,
+        "no_fills":    no_fills,
+    }
 
 
 # ── Backtest ──────────────────────────────────────────────────────────────────
@@ -1002,6 +1254,126 @@ def print_report(
     print()
 
 
+# ── Asian session report + verdict log ───────────────────────────────────────
+
+def print_report_asian(
+    stats: dict,
+    run_label: str = "Trial 25",
+    side: str = "both",
+) -> None:
+    n, gross_pf, net_pf = stats["n"], stats["gross_pf"], stats["net_pf"]
+    ac = _CFG.get("session", {}).get("asian", {})
+    print("\n" + "=" * 60)
+    print(f"  Asian Session Signal — Phase-0 Gate  ({run_label})")
+    print("=" * 60)
+    print(f"  Signal  : Asian box (00-08 UTC) → sweep / range / trend")
+    print(f"  Symbol  : {SYMBOL}  HTF=4H (macro bias)  LTF=1H (box+exit)  side={side}")
+    print(f"  Fill    : sweep=market(09:00 open)  range/trend=limit@sig.entry, "
+          f"cancel@next 00:00 UTC")
+    print(f"  Exit    : {ac.get('first_close_pct',0.75)*100:.0f}% close at box-edge/4R  |  "
+          f"runner: SL→BE, target {ac.get('target_r',5.0):.0f}R")
+    print(f"  Trail   : SL moves to entry (break-even, 0R) after first partial close")
+    print(f"  Box SL  : ±{ac.get('sl_pct_of_range',0.25)*100:.0f}% of box range")
+    print(f"  Fee     : Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip")
+    print("-" * 60)
+    print(f"  Trades  : {n}")
+    print(f"  Win rate: {stats['win_rate']:.1f}%")
+    print(f"  Gross PF: {gross_pf:.4f}")
+    print(f"  Avg fee : {stats['avg_fee_r']:.4f} R")
+    print(f"  Net PF  : {net_pf:.4f}")
+    print(f"  Expect. : {stats.get('expectancy', 0.0):+.4f} R/trade")
+    print(f"  Max DD  : {stats['max_dd_r']:.4f} R")
+    print("-" * 60)
+
+    setup_stats = stats.get("setup_stats", {})
+    if setup_stats:
+        print(f"\n  {'Setup':<8}  {'n':>4}  {'No-fill':>7}  {'Fill%':>6}  {'Win%':>5}  {'Gross PF':>8}")
+        print(f"  {'-'*8}  {'-'*4}  {'-'*7}  {'-'*6}  {'-'*5}  {'-'*8}")
+        for sname in sorted(setup_stats):
+            ss       = setup_stats[sname]
+            gpf      = ss["gross_pf"]
+            gpf_str  = f"{gpf:.4f}" if gpf != float("inf") else "     ∞"
+            nf       = ss.get("no_fills", 0)
+            attempts = ss["n"] + nf
+            fill_pct = ss["n"] / attempts * 100 if attempts else 0.0
+            # SWEEP is always market-filled — fill% is not meaningful
+            fill_str = "  N/A" if sname == "sweep" else f"{fill_pct:.0f}%"
+            print(f"  {sname:<8}  {ss['n']:>4}  {nf:>7}  {fill_str:>6}  "
+                  f"{ss['win_rate']:>4.0f}%  {gpf_str:>8}")
+
+    gate_n  = n >= 50
+    gate_pf = net_pf > 1.0
+    verdict = "PASS" if (gate_n and gate_pf) else "FAIL"
+
+    print(f"\n  Gate n≥50    : {'PASS' if gate_n  else 'FAIL'}  (n={n})")
+    print(f"  Gate net PF>1: {'PASS' if gate_pf else 'FAIL'}  (net PF={net_pf})")
+    print(f"\n  VERDICT: {verdict}")
+    print("=" * 60)
+
+    trades = stats.get("trades", [])
+    if trades:
+        by_year: dict[int, list] = {}
+        for t in trades:
+            try:
+                yr = int(str(t["ts"])[:4])
+            except (ValueError, TypeError):
+                yr = 0
+            by_year.setdefault(yr, []).append(t)
+
+        print(f"\n  {'Year':<6}  {'n':>4}  {'Win%':>5}  {'Gross PF':>8}  {'Net PF':>7}  {'Expect':>7}")
+        print(f"  {'-'*6}  {'-'*4}  {'-'*5}  {'-'*8}  {'-'*7}  {'-'*7}")
+        for yr in sorted(by_year):
+            yt   = by_year[yr]
+            yn   = len(yt)
+            yw   = sum(1 for t in yt if t["net_r"] > 0)
+            ywin = yw / yn * 100 if yn else 0.0
+            ygw  = sum(t["gross_r"] for t in yt if t["gross_r"] > 0)
+            ygl  = abs(sum(t["gross_r"] for t in yt if t["gross_r"] <= 0))
+            ynw  = sum(t["net_r"] for t in yt if t["net_r"] > 0)
+            ynl  = abs(sum(t["net_r"] for t in yt if t["net_r"] <= 0))
+            ygpf = ygw / ygl if ygl else float("inf")
+            ynpf = ynw / ynl if ynl else float("inf")
+            yexp = sum(t["net_r"] for t in yt) / yn
+            print(f"  {yr:<6}  {yn:>4}  {ywin:>4.0f}%  {ygpf:>8.3f}  {ynpf:>7.3f}  {yexp:>+7.3f}")
+
+    if verdict == "PASS":
+        print(f"\n  → Phase-0 cleared. Log {run_label} in VERDICT_LOG.md.")
+        print("  → Proceed to Phase-1 paper trade (30 days, 1H bars monitored, no execution bugs).")
+    else:
+        print(f"\n  → Gate FAILED. Log {run_label}.")
+        print("  → RECOMMEND STOP — per CLAUDE.md §1: do not tune mid-trial, change signal family.")
+    print()
+
+
+def _append_verdict_log(
+    stats: dict, run_label: str, trial_num: int, setup_filter: str = "all",
+) -> None:
+    """Append one row to docs/VERDICT_LOG.md after a completed Asian session trial run."""
+    import datetime as _dt
+    n, gross_pf, net_pf = stats["n"], stats["gross_pf"], stats["net_pf"]
+    verdict = "**✅ PASS**" if (n >= 50 and net_pf > 1.0) else "**FAIL**"
+    gpf_str = f"{gross_pf:.4f}" if gross_pf != float("inf") else "∞"
+    npf_str = f"{net_pf:.4f}"   if net_pf   != float("inf") else "∞"
+    ac      = _CFG.get("session", {}).get("asian", {})
+    date_str = _dt.date.today().isoformat()
+    setup_desc = "sweep / range / trend" if setup_filter == "all" else f"{setup_filter} only"
+    row = (
+        f"| {trial_num} | {date_str} | **Asian session signal** — 4H macro bias + "
+        f"1H Asian box (00-08 UTC) → {setup_desc}. "
+        f"Exit: {ac.get('first_close_pct',0.75)*100:.0f}% at box-edge/4R (SL→BE), "
+        f"runner at {ac.get('target_r',5.0):.0f}R. "
+        f"SL=±{ac.get('sl_pct_of_range',0.25)*100:.0f}% of box range. "
+        f"Config: smc_bot/config.yaml session.asian. "
+        f"5yr holdout (--htf BTCUSDT_240m, --ltf BTCUSDT_60m). | 4H+1H | "
+        f"{n} | {gpf_str} | {stats['avg_fee_r']:.4f} | "
+        f"{npf_str} | {stats['win_rate']:.1f}% | {verdict} |\n"
+    )
+    path = ROOT / "docs" / "VERDICT_LOG.md"
+    with open(path, "a") as f:
+        f.write(row)
+    print(f"  → Verdict row appended to {path}")
+
+
 # ── Phase-D funnel ────────────────────────────────────────────────────────────
 
 def count_funnel(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> dict:
@@ -1292,6 +1664,26 @@ def main() -> None:
             "(e.g. 0.01 = require ≥1%% from mid). 0.0 = disabled (default)."
         ),
     )
+    parser.add_argument(
+        "--signal", default="smc", choices=["smc", "asian_session"],
+        help=(
+            "Signal type: 'smc' = existing 15-step SMC chain (default); "
+            "'asian_session' = Asian box (00-08 UTC) sweep/range/trend signal. "
+            "When using asian_session, --htf must be the 4H parquet and --ltf the 1H parquet."
+        ),
+    )
+    parser.add_argument(
+        "--trial", type=int, default=25,
+        help="Trial number appended to VERDICT_LOG.md row (asian_session mode only; default: 25)",
+    )
+    parser.add_argument(
+        "--asian-setup", default="all", choices=["all", "sweep", "range", "trend"],
+        help=(
+            "Asian session setup filter: 'all' = sweep+range+trend (default); "
+            "'sweep' = stop-hunt reversal only; 'range' = tight box only; "
+            "'trend' = wide box continuation only."
+        ),
+    )
     args = parser.parse_args()
 
     for label, path in [("HTF (1H)", args.htf), ("LTF (5M)", args.ltf)]:
@@ -1344,6 +1736,20 @@ def main() -> None:
     htf_label = _tf_label(args.htf)
     ltf_label = _tf_label(args.ltf)
     run_label = args.run_label or "Trial X"
+
+    # ── Asian session signal path ─────────────────────────────────────────────
+    if args.signal == "asian_session":
+        # df_1h here holds the HTF parquet (must be 4H); df_5m holds LTF (must be 1H).
+        # _precompute(df_1h, df_5m) already stored 4H/1H arrays in the _1H/_5M globals.
+        setup_filter = args.asian_setup
+        print(f"Running Asian session backtest … (setup={setup_filter})", flush=True)
+        stats = run_backtest_asian(df_4h=df_1h, df_1h=df_5m, side=args.side, setup_filter=setup_filter)
+        print_report_asian(stats, run_label=run_label, side=args.side)
+        sys.stdout.flush()
+        if args.csv:
+            save_trades_csv(stats, args.csv)
+        _append_verdict_log(stats, run_label, args.trial, setup_filter=setup_filter)
+        return
 
     if args.sensitivity:
         # ── Trial 10 sensitivity matrix: baseline + wick×3 + close×3 ────────

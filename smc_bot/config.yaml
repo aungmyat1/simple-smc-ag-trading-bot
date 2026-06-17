@@ -53,7 +53,7 @@ data:
   htf_limit: 200    # 4H candles to fetch (~33 days for POI detection)
   ltf_limit: 150    # 1H candles to fetch (~6 days for sweep/CHoCH)
 
-signal_only_mode: true   # true = log signals, never execute orders; flip to false for demo execution
+signal_only_mode: false  # Phase-1a: paper mode (LIVE_TRADING not set → executor logs intent only)
 
 # Session filter (Sprint 3) — London 08-15 UTC, NY 13-21 UTC
 # Untested on 4H+1H chain; kept from 1H+5M configuration. Register as new trial before enabling in production.

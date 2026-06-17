@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=aungp
 WorkingDirectory=/home/aungp/simple-smc-ag-trading-bot
-ExecStart=/home/aungp/ag-auto-trade/.venv/bin/python -m smc_bot.bot
+ExecStart=/home/aungp/simple-smc-ag-trading-bot/.venv/bin/python -m smc_bot.bot
 Restart=on-failure
 RestartSec=30
 # Give the bot 10 s to flush state on SIGTERM before SIGKILL
