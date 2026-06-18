@@ -610,6 +610,26 @@ def _fast_displacement(sweep_bar: int, i: int, bias: str) -> bool:
     return False
 
 
+# ── Date-window slice (in-sample / out-of-sample / walk-forward) ──────────────
+
+def _slice_by_date(df: pd.DataFrame, frm: str | None, to: str | None) -> pd.DataFrame:
+    """Restrict a frame to [frm, to] by bar OPEN time (UTC, both inclusive).
+
+    frm/to are 'YYYY-MM-DD' calendar dates or None. `to` is inclusive of its
+    whole calendar day. Used to carve an untouched out-of-sample year, or to roll
+    walk-forward windows — always with the SAME locked params (no per-window
+    tuning; per CLAUDE.md §1 a parameter change is a new trial, not a refit)."""
+    if "ts" not in df.columns or (frm is None and to is None):
+        return df
+    ts   = pd.to_datetime(df["ts"], utc=True)
+    mask = pd.Series(True, index=df.index)
+    if frm:
+        mask &= ts >= pd.Timestamp(frm, tz="UTC")
+    if to:
+        mask &= ts < pd.Timestamp(to, tz="UTC") + pd.Timedelta(days=1)
+    return df.loc[mask].reset_index(drop=True)
+
+
 # ── HTF alignment ─────────────────────────────────────────────────────────────
 
 def _align_htf(df_1h: pd.DataFrame, df_5m: pd.DataFrame) -> np.ndarray:
@@ -1763,6 +1783,16 @@ def main() -> None:
         "--pip-size", type=float, default=0.0001,
         help="forex cost: pip size (default 0.0001 majors; use 0.01 for JPY pairs).",
     )
+    # ── In-sample / out-of-sample / walk-forward date window ───────────────────
+    parser.add_argument(
+        "--from", dest="date_from", default=None,
+        help="restrict to bars on/after this UTC date (YYYY-MM-DD). "
+             "Use to roll walk-forward windows or hold out an OOS year — same params.",
+    )
+    parser.add_argument(
+        "--to", dest="date_to", default=None,
+        help="restrict to bars on/before this UTC date (YYYY-MM-DD, inclusive).",
+    )
     args = parser.parse_args()
 
     # Apply forex cost-model settings (no-op for default --cost-model pct)
@@ -1778,12 +1808,19 @@ def main() -> None:
             print("     python scripts/fetch_data.py --interval 5  --days 730")
             sys.exit(1)
 
+    if args.date_from or args.date_to:
+        print(f"Date window: from={args.date_from or '-'}  to={args.date_to or '-'} (UTC, inclusive)", flush=True)
+
     print(f"Loading 1H  from {args.htf} …", flush=True)
-    df_1h = pd.read_parquet(args.htf)
+    df_1h = _slice_by_date(pd.read_parquet(args.htf), args.date_from, args.date_to)
+    if df_1h.empty:
+        print("No HTF bars in the requested date window."); sys.exit(1)
     print(f"  {len(df_1h)} bars | {df_1h['ts'].iloc[0]} → {df_1h['ts'].iloc[-1]}", flush=True)
 
     print(f"Loading 5M  from {args.ltf} …", flush=True)
-    df_5m = pd.read_parquet(args.ltf)
+    df_5m = _slice_by_date(pd.read_parquet(args.ltf), args.date_from, args.date_to)
+    if df_5m.empty:
+        print("No LTF bars in the requested date window."); sys.exit(1)
     if args.max_bars:
         df_5m = df_5m.iloc[: args.max_bars].copy()
         print(f"  PROFILING SLICE: first {args.max_bars} bars", flush=True)
@@ -1799,7 +1836,7 @@ def main() -> None:
             print("Run: python scripts/fetch_data.py --interval 240 --days 730")
             sys.exit(1)
         print(f"Loading 4H  from {args.macro_htf} …", flush=True)
-        df_4h = pd.read_parquet(args.macro_htf)
+        df_4h = _slice_by_date(pd.read_parquet(args.macro_htf), args.date_from, args.date_to)
         print(f"  {len(df_4h)} bars | {df_4h['ts'].iloc[0]} → {df_4h['ts'].iloc[-1]}", flush=True)
         _precompute_4h(df_4h, df_5m)
         MACRO_BIAS = True
