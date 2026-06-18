@@ -9,3 +9,4 @@ requests>=2.31
 fastapi>=0.100       # dashboard web server
 uvicorn>=0.23        # ASGI runner
 pytest>=8.0          # testing
+metaapi-cloud-sdk>=29,<30  # validated on 29.1.1; blocks breaking 30.x
