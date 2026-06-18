@@ -74,7 +74,26 @@ python scripts/fetch_forex_data.py --symbol GBPUSD --interval 60  --days 1825
 
 ---
 
-## Run the gate (per symbol, per setup mode)
+## Run the gate (turnkey — recommended)
+
+One command runs both symbols × all setup modes × a **spread-sensitivity sweep**
+and prints a single go/no-go. A setup only earns a robust PASS if it clears the
+gate (n≥50, net PF>1.0) at *every* spread level — guarding against a verdict that
+hinges on one guessed spread:
+
+```bash
+python scripts/forex_phase0.py                       # EURUSD+GBPUSD, spreads 0.8/1.2/2.0
+python scripts/forex_phase0.py --spreads 0.8 1.5 2.5 # custom stress range
+```
+
+Output: per-symbol table of `n / netPF` per spread (✓ = clears gate), then GO /
+NO-GO. Exit 0 if any (symbol, mode) is a robust PASS. This does not auto-append
+to VERDICT_LOG — log the passing/failing trial rows manually (Trial 27/28 below).
+
+## Run the gate (granular — per symbol, per setup mode)
+
+Use this when you want the full per-trial report (per-year breakdown, auto
+VERDICT_LOG row) for a specific symbol/mode:
 
 ```bash
 # EURUSD — all modes, then split out each mode for its own n≥50 / PF>1 check

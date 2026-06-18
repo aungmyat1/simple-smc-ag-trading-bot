@@ -223,3 +223,20 @@ Options after Trials 11–12:
 | V3 | PENDING | **Breaker Block**: 4H+1H chain. Identify violated OBs (price closed strongly through zone) → flip polarity → enter on retest of breaker in new direction. [NEEDS-TRANSCRIPT] "strongly closes through" threshold, lookback, SL/RR. Requires `poi.py` change to re-polarise violated zones. 5yr holdout. Gate: n≥50 AND gross PF>1.0. | 4H+1H | — | — | — | — | — | **PENDING** — requires `smc_bot/entry_modes.py::breaker_entry()` implementation + `poi.py` breaker detection + separate backtest trial. Do NOT merge PnL with Trial 21 or V2. |
 | 25 | 2026-06-17 | **Asian session signal** — 4H macro bias + 1H Asian box (00-08 UTC) → sweep / range / trend. Exit: 75% at box-edge/4R (SL→BE), runner at 5R. SL=±25% of box range. Config: smc_bot/config.yaml session.asian. 5yr holdout (--htf BTCUSDT_240m, --ltf BTCUSDT_60m). | 4H+1H | 921 | 0.5091 | 0.3696 | 0.3279 | 13.0% | **FAIL** |
 | 26 | 2026-06-17 | **Asian session signal (SWEEP-ONLY)** — 4H macro bias + 1H Asian box (00-08 UTC) → sweep setup only (TREND/RANGE disabled). Exit: 75% at box-edge (SL→BE), runner at 5R. SL=±25% of box range. 5yr holdout. | 4H+1H | 66 | 1.5208 | 0.3642 | 0.9716 | 34.9% | **FAIL** — net PF 0.97 (gate miss 2.84%). Cause: structural fee drag (0.36R avg from 25%-of-box-range stop) + mean-reversion failure in strong trend (2024: 0/10, all losses). Year breakdown: 2021 net PF 9.13 (n=5), 2022 0.88, 2023 1.69, **2024 0.00**, 2025 0.84, 2026 1.38. 3/6 years FAIL. **Asian session signal family retired.** Return to 4H+1H SMC chain (T21/T22). |
+
+---
+
+## PENDING Trials — Forex Pivot (Step 5, validate-first)
+
+Strategic fork (2026-06-18): **validate-first** + **forex replaces BTC**. The
+session-box signal (`session_range.py`) is repointed from BTC (24/7, where it
+died — Trials 25/26) to forex pairs that have a real session open. Cost model is
+**forex** (spread + commission in pips, not Bybit %): see `docs/FOREX_VALIDATION.md`.
+Run on the VPS — forex feeds are network-gated in the web container.
+Runner: `python scripts/forex_phase0.py` (spread-sensitivity sweep; robust PASS =
+clears n≥50 & net PF>1.0 at every spread level).
+
+| Trial | Date | Signal | TF | n | Gross PF | Avg fee (R) | Net PF | Win% | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| 27 | PENDING | **EURUSD session box** — 4H macro bias + 1H box (00-08 UTC, Asian range) → sweep/range/trend, per mode. Cost=forex (spread 0.8/1.2/2.0 pip sweep + 0.6 pip commission rt). 5yr holdout. `scripts/fetch_forex_data.py --symbol EURUSD …` then `forex_phase0.py`. Gate per mode: n≥50 AND net PF>1.0 robust across spreads. | 4H+1H | — | — | — | — | — | **PENDING** — needs VPS data. Verdict gates Steps 2-4 (broker adapter, lot sizing, config repoint). |
+| 28 | PENDING | **GBPUSD session box** — same chain/exit as Trial 27. Cost=forex (start spread 1.2 pip — GBPUSD runs wider). 5yr holdout. | 4H+1H | — | — | — | — | — | **PENDING** — needs VPS data. Wider-spread sibling of Trial 27. |
