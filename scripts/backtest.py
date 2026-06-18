@@ -805,8 +805,13 @@ def run_backtest_asian(
             continue
 
         now_utc     = pd.to_datetime(df_1h["ts"].iloc[i], utc=True)
-        df_4h_slice = df_4h.iloc[: htf_idx + 1]
-        df_1h_slice = df_1h.iloc[: i + 1]
+        # Bound slices to last 200 bars so build_session_signal is O(1) per call,
+        # not O(n²) across the backtest. ATR-14 and swing bias both converge within
+        # ~50 bars; 200 gives comfortable headroom without rescanning the full history.
+        htf_start   = max(0, htf_idx - 199)
+        df_4h_slice = df_4h.iloc[htf_start: htf_idx + 1]
+        ltf_start   = max(0, i - 199)
+        df_1h_slice = df_1h.iloc[ltf_start: i + 1]
 
         sig = sr.build_session_signal(df_4h_slice, df_1h_slice, _CFG, now_utc=now_utc)
         if sig is None:

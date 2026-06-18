@@ -85,46 +85,53 @@ def _most_recent_completed_box(
               (guards against sparse API responses near the window boundary).
 
     now_utc is injectable for deterministic unit tests.
+
+    Performance: scans only the last 168 bars (7-day tail).  The most-recently
+    completed session is always within 7 calendar days, so scanning the full
+    growing history is unnecessary and O(n²) in the backtest loop.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
 
     # Latest date whose session is complete
-    if now_utc.hour < end_h:
-        cutoff_date = (now_utc - timedelta(days=1)).date()
-    else:
-        cutoff_date = now_utc.date()
+    cutoff_dt = (now_utc - timedelta(days=1)) if now_utc.hour < end_h else now_utc
+    cutoff_day = cutoff_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    df = df_1h_box.copy()
-    ts = pd.to_datetime(df["ts"], utc=True)
-    df["_date"] = ts.dt.date
-    df["_hour"] = ts.dt.hour
+    # Only scan the trailing 168 bars — the most recent session is always within 7 days.
+    tail = df_1h_box.iloc[-168:] if len(df_1h_box) > 168 else df_1h_box
+    ts = pd.to_datetime(tail["ts"].values, utc=True)
+    hour = ts.hour
+    day  = ts.normalize()  # floor to midnight UTC — avoids slow .dt.date
 
-    mask = (df["_hour"] >= start_h) & (df["_hour"] < end_h) & (df["_date"] <= cutoff_date)
-    window = df[mask]
-    if window.empty:
+    cutoff_ts = pd.Timestamp(cutoff_day)  # already UTC-aware from now_utc
+    mask = (hour >= start_h) & (hour < end_h) & (day <= cutoff_ts)
+    window_idx = mask.nonzero()[0]
+    if len(window_idx) == 0:
         log.debug("No completed Asian session bars in df_1h_box")
         return None
 
-    latest_date = window["_date"].max()
-    box_bars = window[window["_date"] == latest_date]
+    # Find the latest session date present
+    latest_day = day[window_idx].max()
+    box_idx = window_idx[day[window_idx] == latest_day]
 
-    if len(box_bars) < min_bars:
+    if len(box_idx) < min_bars:
         log.debug(
             "Asian session %s has only %d/%d bars — skipping (need %d)",
-            latest_date, len(box_bars), end_h - start_h, min_bars,
+            latest_day.date(), len(box_idx), end_h - start_h, min_bars,
         )
         return None
 
-    high = float(box_bars["high"].max())
-    low  = float(box_bars["low"].min())
-    rng  = high - low
+    highs = tail["high"].values[box_idx]
+    lows  = tail["low"].values[box_idx]
+    high  = float(highs.max())
+    low   = float(lows.min())
+    rng   = high - low
 
     if rng <= 0:
-        log.debug("Asian session box %s has zero range", latest_date)
+        log.debug("Asian session box %s has zero range", latest_day.date())
         return None
 
-    return SessionBox(high=high, low=low, range=rng, date=str(latest_date))
+    return SessionBox(high=high, low=low, range=rng, date=str(latest_day.date()))
 
 
 # ---------------------------------------------------------------------------
