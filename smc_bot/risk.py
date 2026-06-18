@@ -21,8 +21,9 @@ def calc_qty(
     risk_usd: float | None = None,
 ) -> float:
     """
-    Return position size in BTC, snapped to BYBIT_QTY_STEP and floored at
-    BYBIT_MIN_QTY.  Returns 0.0 if the stop distance is zero/negative.
+    Return position size in BTC, snapped to BYBIT_QTY_STEP.  Returns 0.0 if
+    the computed qty is below BYBIT_MIN_QTY or stop distance is zero/negative.
+    Never rounds up to BYBIT_MIN_QTY — that would silently breach the risk cap.
 
     Sizing modes (mutually exclusive; risk_usd takes priority):
       risk_usd  — fixed dollar risk per trade: qty = risk_usd / stop_dist
