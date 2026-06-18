@@ -4,16 +4,18 @@ SMC Bot — main loop.
 Run with:
     python -m smc_bot.bot
 
-Every 5M candle close (15-step workflow per CLAUDE.md §2):
-  1-2.  1H swing bias (bullish / bearish / neutral)
+On every poll (default 5 min — see _sleep_to_next_candle) runs the 15-step
+workflow per CLAUDE.md §2 on HTF (config exchange.htf) + LTF (exchange.ltf).
+Trial 21/22 baseline: HTF=4h, LTF=1h.
+  1-2.  HTF swing bias (bullish / bearish / neutral)
   3.    Fib 50% filter — long only in discount, short only in premium
-  4.    1H OB/FVG POI zones marked
+  4.    HTF OB/FVG POI zones marked (mitigation filter OFF — see poi.mitigation_*)
   5.    HTF equal highs/lows identified as BSL/SSL targets
-  6.    Wait for price to tap a 1H POI zone
-  7-8.  5M liquidity sweep (stop-hunt of prior swing low/high)
-  9.    Post-sweep displacement candle confirmed (≥1.5×ATR)
-  10.   5M CHoCH (structural break confirming reversal)
-  11-12. 5M OB/FVG entry zone found; wait for price retrace into it
+  6.    Wait for price to tap an HTF POI zone
+  7-8.  LTF liquidity sweep (stop-hunt of prior swing low/high)
+  9.    Post-sweep displacement candle confirmed (≥ displacement_atr × ATR)
+  10.   LTF CHoCH (structural break confirming reversal)
+  11-12. LTF OB/FVG entry zone found; wait for price retrace into it
   13.   SL placed at sweep wick ± buffer
   14.   TP at nearest BSL/SSL pool (≥1.5R) or fallback 2R
   15.   Partial plan: 50% at 1R → SL to BE → remainder at TP
@@ -83,6 +85,8 @@ class BotState:
     entry_price:        float = 0.0   # price at which the position was entered
     entry_qty:          float = 0.0   # full position size at entry (BTC)
     tp1_filled:         bool  = False  # True once TP1 reduce-only limit has filled
+    # Signal dedup — ts of the last LTF candle a signal was acted on (one per candle)
+    last_signal_ts:     str   = ""
 
     def save(self) -> None:
         _STATE_FILE.write_text(json.dumps(asdict(self), indent=2))
@@ -382,7 +386,9 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
             session_name = "London/NY overlap"
         log.info("Kill zone active: %s (hour=%02d UTC)", session_name, h)
 
-    # ── STEP 4: Mark 1H OB/FVG demand (bullish) / supply (bearish) zones ─────
+    # ── STEP 4: Mark HTF OB/FVG demand (bullish) / supply (bearish) zones ─────
+    htf_lbl = cfg["exchange"]["htf"].upper()
+    ltf_lbl = cfg["exchange"]["ltf"].upper()
     pois = poi.get_pois(
         df_1h,
         bias,
@@ -390,16 +396,27 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         fvg_lookback     = cfg["poi"]["fvg_lookback"],
         displacement_atr = cfg["poi"]["displacement_atr"],
     )
-    # Trial 6: exclude zones already mitigated (price through ≥50% of zone)
-    raw_count = len(pois)
-    pois = poi.filter_fresh_zones(pois, df_1h, bias)
-    if len(pois) < raw_count:
-        log.info(
-            "Mitigation filter: %d/%d 1H zones rejected (bias=%s)",
-            raw_count - len(pois), raw_count, bias,
+    # Mitigation / freshness filter — DISABLED by default (poi.mitigation_enabled).
+    # Trials 9–10 proved it rejects ~76% of 4H zones and collapses the signal count
+    # to near-zero; every PASS (Trial 8/20/21/22) ran with it OFF. Enabling it is a
+    # new trial (CLAUDE.md §1) — never silently on, or the live bot diverges from
+    # the validated backtest and rejects essentially every POI.
+    pc = cfg.get("poi", {})
+    if pc.get("mitigation_enabled", False):
+        raw_count = len(pois)
+        pois = poi.filter_fresh_zones(
+            pois, df_1h, bias,
+            consume_pct = float(pc.get("mitigation_pct", 50)) / 100.0,
+            mode        = pc.get("mitigation_mode", "wick"),
         )
+        if len(pois) < raw_count:
+            log.info(
+                "Mitigation filter: %d/%d %s zones rejected (bias=%s)",
+                raw_count - len(pois), raw_count, htf_lbl, bias,
+            )
     if not pois:
-        log.info("No fresh 1H POI zones after mitigation filter")
+        suffix = " (after mitigation filter)" if pc.get("mitigation_enabled", False) else ""
+        log.info("No %s POI zones%s (bias=%s)", htf_lbl, suffix, bias)
         return
 
     # ── STEP 5: Identify HTF equal lows/highs as TP target (BSL/SSL) ─────────
@@ -414,12 +431,12 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     # FVG-only taps are not valid entries; both zones must exist in the POI list.
     active = poi.price_in_poi(price, pois)
     if active is None:
-        log.info("Price %.2f not in any 4H OB/FVG zone", price)
+        log.info("Price %.2f not in any %s OB/FVG zone", price, htf_lbl)
         return
     fvg_ok = poi.has_fvg(pois)
     log.info(
-        "Price in 4H %s [%.2f – %.2f] | FVG present: %s",
-        active.get("kind", "zone"), active["low"], active["high"],
+        "Price in %s %s [%.2f – %.2f] | FVG present: %s",
+        htf_lbl, active.get("kind", "zone"), active["low"], active["high"],
         "YES" if fvg_ok else "no",
     )
 
@@ -432,7 +449,7 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         swing_n  = lc["swing_n"],
     )
     if sweep is None:
-        log.info("No 5M liquidity sweep detected")
+        log.info("No %s liquidity sweep detected", ltf_lbl)
         return
     log.info(
         "Sweep: bar=%d level=%.2f wick=%.2f",
@@ -526,6 +543,19 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         log.warning("qty=0; skipping (stop distance too wide for $%.0f risk?)", rc.get("risk_usd", 0))
         return
 
+    # ── Signal dedup — act on each LTF candle at most once ─────────────────────
+    # The poll interval (5 min) is shorter than the LTF candle, so the chain
+    # re-confirms the SAME setup on every poll until a new LTF candle closes.
+    # Without this guard signal_only_mode logs/alerts the same setup ~12×/hour,
+    # and PAPER execution (signal_only=false + LIVE_TRADING=false) flip-flops a
+    # synthetic order every poll — both corrupt the Phase-1 signal/trade count.
+    ltf_ts = str(df_5m["ts"].iloc[-1])
+    if ltf_ts == state.last_signal_ts:
+        log.debug("Signal already handled for LTF candle %s — skipping duplicate", ltf_ts)
+        return
+    state.last_signal_ts = ltf_ts
+    state.save()
+
     signal_only = cfg.get("signal_only_mode", True)
     mode        = "SIGNAL_ONLY" if signal_only else "EXECUTE"
 
@@ -574,7 +604,7 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         "5M MSS/BOS":             "Yes",
         "MSS Strength":           mss_strength,
         "Entry Type":             entry_type,
-        "Entry TF":               "5M",
+        "Entry TF":               ltf_lbl,
         "Entry Price":            round(price, 2),
         "Stop Loss":              round(sl, 2),
         "TP1":                    round(tp1_price, 2),

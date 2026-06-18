@@ -29,6 +29,15 @@ poi:
   ob_lookback: 50   # max 4H bars to scan backwards for OBs (~200 days)
   fvg_lookback: 30  # max 4H bars to scan backwards for FVGs (~120 days)
   displacement_atr: 1.5   # 4H OB displacement must be >= 1.5 × ATR(14)
+  # ── Mitigation / freshness filter — KEEP DISABLED ──────────────────────────
+  # Trials 9–10 proved this filter at 4H rejects ~76% of zones and collapses the
+  # CHoCH signal count from 188 → 3 (docs/VERDICT_LOG.md). Every PASS result
+  # (Trial 8 / 20 / 21 / 22) ran with it OFF. Enabling it does NOT reproduce the
+  # validated edge — it is the root cause of "all POIs rejected by mitigation".
+  # Flipping this ON = a new trial per CLAUDE.md §1 (register it in VERDICT_LOG).
+  mitigation_enabled: false
+  mitigation_pct: 50      # 50 | 75 | 100 — only used when mitigation_enabled: true
+  mitigation_mode: wick   # wick (Trial 9) | close (Trial 10) — only used when enabled
 
 liquidity:
   swing_n: 3        # bars each side for 1H swing detection
