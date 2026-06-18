@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 
 from smc_bot import (
     alerts, confirmation, data, executor, fib as fib_mod,
-    liquidity, poi, risk, structure, targets as tgt_mod,
+    liquidity, poi, risk, session_range as sr, structure, targets as tgt_mod,
 )
 
 load_dotenv()
@@ -334,6 +334,24 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         log.warning("Empty or stale candle data; skipping cycle")
         return
 
+    # ── P3: Asian session range signal (PROPOSE-ONLY, Phase-0 PENDING) ───────
+    # Frame contract: df_1h holds 4H candles (htf), df_5m holds 1H candles (ltf).
+    # session_range uses df_1h as df_4h_bias and df_5m as df_1h_box.
+    # Never executes — logs proposals only until Phase-0 gate passes.
+    _as_sig = sr.build_session_signal(df_1h, df_5m, cfg)
+    if _as_sig is not None:
+        log.info(
+            "[ASIAN-SESSION PROPOSAL] %s setup=%s entry=%.2f sl=%.2f tp=%.2f "
+            "first_close=%.2f mgmt=%s",
+            _as_sig.side, _as_sig.setup, _as_sig.entry, _as_sig.sl, _as_sig.tp,
+            _as_sig.mgmt["first_close_at"], _as_sig.mgmt,
+        )
+        alerts.send(
+            f"📊 ASIAN SESS [{sym}] {_as_sig.side} {_as_sig.setup} "
+            f"entry={_as_sig.entry:.0f} sl={_as_sig.sl:.0f} tp={_as_sig.tp:.0f} "
+            f"(PROPOSAL — Phase-0 pending)"
+        )
+
     # ── WORKFLOW STEP 1-2: 1H bias + swing range ─────────────────────────────
     swing_n = cfg["structure"]["swing_n"]
     bias = structure.get_bias(df_1h, swing_n=swing_n)
@@ -557,10 +575,10 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     )
 
     # ── Signal log / trade journal (always written) ───────────────────────────
-    now       = datetime.now(timezone.utc)
-    session, kill_zone = _session_and_killzone(now)
-    trade_id  = f"{now.strftime('%Y%m%d')}_{sym}_{now.strftime('%H%M%S')}"
-    poi_label = f"{htf_lbl} {bias.capitalize()} {'Order Block' if active['kind'] == 'OB' else 'FVG'}"
+    now          = datetime.now(timezone.utc)
+    session_name, kill_zone = _session_and_killzone(now)    # renamed: avoid shadowing pybit `session`
+    trade_id     = f"{now.strftime('%Y%m%d')}_{sym}_{now.strftime('%H%M%S')}"
+    poi_label = f"1H {bias.capitalize()} {'Order Block' if active['kind'] == 'OB' else 'FVG'}"
     entry_type = (
         f"{'OB' if ltf_entry_zone['kind'] == 'OB' else 'FVG'} Retest"
         if ltf_entry_zone else "Market"
@@ -575,7 +593,7 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         "Trade ID":               trade_id,
         "Pair":                   sym,
         "Day":                    now.strftime("%A"),
-        "Session":                session,
+        "Session":                session_name,
         "Kill Zone":              kill_zone,
         "Direction":              "Long" if side == "Buy" else "Short",
         "HTF Bias":               bias.capitalize(),
