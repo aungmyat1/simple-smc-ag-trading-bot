@@ -1,0 +1,119 @@
+# Multi-strategy configuration
+# LIVE_TRADING is always read from .env — never hardcoded here.
+# Changing any strategy parameter = new trial row in docs/VERDICT_LOG.md.
+
+# ── Service mode ──────────────────────────────────────────────────────────────
+service:
+  smc_sniper:     true   # run SMC Sniper
+  session_trader: true   # run Session Trader
+
+symbols:
+  - EURUSD
+  - GBPUSD
+
+runner:
+  loop_interval_seconds: 60   # how often to poll for signals
+
+# ── Broker ────────────────────────────────────────────────────────────────────
+broker:
+  type: metaapi                # "metaapi" | "paper"
+  # token and account_id read from .env (METAAPI_TOKEN, METAAPI_ACCOUNT_ID)
+
+# ── SMC Sniper (Strategy 1) ───────────────────────────────────────────────────
+# Magic: EURUSD=11001, GBPUSD=11002
+# Timeframes: HTF=4H, LTF=1H
+smc_sniper:
+  htf: 240m
+  ltf: 60m
+  htf_bars: 200
+  ltf_bars: 100
+
+  structure:
+    swing_n: 3
+
+  fib:
+    level: 0.5
+
+  poi:
+    ob_lookback: 60
+    fvg_lookback: 30
+    displacement_atr: 1.0
+    mitigation_enabled: false
+    mitigation_pct: 50
+    mitigation_mode: wick
+
+  liquidity:
+    swing_n: 2
+    lookback: 20
+    displacement_atr: 1.0
+    ltf_poi_lookback: 15
+    fvg_retest_enabled: true
+    fvg_retest_lookforward: 20
+
+  confirmation:
+    lookback: 8
+
+  targets:
+    equal_level_tolerance: 0.0005   # 5 pips
+    min_r: 1.5
+    fallback_r: 3.0
+
+  risk:
+    sl_buffer: 0.0002              # 2 pips
+    target_r: 3.0
+    pip_value_eurusd: 10.0         # USD per pip per 1 lot (standard lot)
+    pip_value_gbpusd: 10.0
+
+  partials:
+    tp1_r: 1.0
+    tp1_pct: 0.50
+
+  limits:
+    max_daily_loss_pct: 0.02
+    max_drawdown_pct: 0.10
+    max_consec_losses: 5
+    risk_per_trade_pct: 0.005
+
+# ── Session Trader (Strategy 2) ───────────────────────────────────────────────
+# Magic: EURUSD=12001, GBPUSD=12002
+# Timeframes: HTF=4H (macro bias), LTF=1H (session range)
+# Sessions: London 08:00-16:00 UTC | New York 13:00-21:00 UTC
+session_trader:
+  htf: 240m
+  ltf: 60m
+  htf_bars: 60
+  ltf_bars: 72   # 3 full days of 1H candles
+
+  london:
+    start_h: 8
+    end_h: 16
+    range_start_h: 8    # Initial Balance window opens
+    range_end_h: 10     # Initial Balance window closes (range locked after this hour)
+
+  new_york:
+    start_h: 13
+    end_h: 21
+    range_start_h: 13
+    range_end_h: 15
+
+  sweep_beyond_pips: 2.0
+  pip_size: 0.0001
+  sl_buffer_pips: 3.0
+  displacement_atr: 1.0
+  choch_lookback: 8
+  fvg_lookforward: 12
+  min_range_pips: 10.0
+  london_tp_r: 1.5
+  ny_tp_r: 2.0
+  tp1_pct: 0.75
+  macro_bias_swing_n: 3
+
+  risk:
+    pip_value_eurusd: 10.0
+    pip_value_gbpusd: 10.0
+
+  limits:
+    max_daily_loss_pct: 0.02
+    max_drawdown_pct: 0.10
+    max_consec_losses: 5
+    risk_per_trade_pct: 0.005

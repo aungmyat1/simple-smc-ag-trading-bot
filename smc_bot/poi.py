@@ -130,6 +130,14 @@ def has_fvg(zones: list[dict]) -> bool:
     return any(z.get("kind") == "FVG" for z in zones)
 
 
+
+def fvg_for_price(price: float, zones: list[dict]) -> dict | None:
+    """Return first FVG zone containing price, or None (FVG-retest entry gate)."""
+    for z in zones:
+        if z.get("kind") == "FVG" and z["low"] <= price <= z["high"]:
+            return z
+    return None
+
 def filter_fresh_zones(
     zones: list[dict],
     df: pd.DataFrame,
@@ -267,3 +275,58 @@ def get_ltf_pois(
 
     log.debug("LTF POI zones (bias=%s, start=%d): %d found", bias, start_bar, len(zones))
     return zones
+
+
+def get_owned_fvg(
+    df: "pd.DataFrame",
+    bias: str,
+    sweep_bar: int,
+    choch_bar: int,
+    displacement_atr: float = 1.5,
+) -> "dict | None":
+    """
+    Return the FVG owned by the first displacement candle in [sweep_bar+1, choch_bar].
+
+    Displacement = first candle with range ≥ displacement_atr × ATR14 and a
+    directional body (bearish for shorts, bullish for longs).
+
+    Owned FVG = 3-bar gap centred on that displacement candle:
+      bearish: fvg_hi = low[disp-1]   fvg_lo = high[disp+1]
+      bullish: fvg_lo = high[disp-1]  fvg_hi = low[disp+1]
+
+    Returns {"kind": "FVG", "low": fvg_lo, "high": fvg_hi, "creation_bar": fvg_bar}
+    or None if no qualifying displacement or gap is found.
+
+    For bot.py use: pass choch_bar = len(df) - 2 (the bar just confirmed as CHoCH,
+    where df has n bars and bar n-1 is the current bar where CHoCH fires).
+    """
+    n      = len(df)
+    atr    = _atr14(df)
+    high   = df["high"].values
+    low    = df["low"].values
+    open_  = df["open"].values
+    close  = df["close"].values
+
+    scan_start = max(sweep_bar + 1, 1)
+    scan_end   = min(choch_bar, n - 2)   # fvg_bar = j+1 must be < n
+
+    for j in range(scan_start, scan_end + 1):
+        if (high[j] - low[j]) < displacement_atr * atr:
+            continue
+        if bias == "bearish" and close[j] >= open_[j]:
+            continue
+        if bias == "bullish" and close[j] <= open_[j]:
+            continue
+        fvg_bar = j + 1
+        if bias == "bearish":
+            fvg_hi = float(low[j - 1])
+            fvg_lo = float(high[fvg_bar])
+            if fvg_hi > fvg_lo:
+                return {"kind": "FVG", "low": fvg_lo, "high": fvg_hi, "creation_bar": fvg_bar}
+        else:
+            fvg_lo = float(high[j - 1])
+            fvg_hi = float(low[fvg_bar])
+            if fvg_hi > fvg_lo:
+                return {"kind": "FVG", "low": fvg_lo, "high": fvg_hi, "creation_bar": fvg_bar}
+    return None
+

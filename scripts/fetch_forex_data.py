@@ -78,21 +78,26 @@ async def _fetch(symbol: str, interval: str, days: int) -> pd.DataFrame:
         start_ts = datetime.now(timezone.utc) - timedelta(days=days)
         rows: list[dict] = []
         cursor: datetime | None = None  # None = newest; page backward via earliest time
+        prev_earliest: pd.Timestamp | None = None
 
         print(f"Fetching {days}d of {symbol} {timeframe} from MetaAPI …")
-        while True:
+        for _page in range(2000):  # guard: 2000×1000 candles ≫ 5yr of 1h/4h
             # get_historical_candles(symbol, timeframe, start_time, limit):
-            # returns up to `limit` candles ENDING at start_time (older direction).
+            # returns up to `limit` candles with time <= start_time (backward).
             candles = await account.get_historical_candles(
                 symbol, timeframe, cursor, _PAGE,
             )
             if not candles:
                 break
             rows.extend(candles)
-            earliest = pd.to_datetime(candles[0]["time"], utc=True)
+            # Do not assume batch order — page from the oldest candle in the batch.
+            batch_times = pd.to_datetime([c["time"] for c in candles], utc=True)
+            earliest = batch_times.min()
             if earliest <= start_ts:
                 break
-            # next page ends just before the earliest candle we have
+            if prev_earliest is not None and earliest >= prev_earliest:
+                break  # no backward progress — broker has no older data
+            prev_earliest = earliest
             cursor = earliest.to_pydatetime() - timedelta(seconds=1)
             await asyncio.sleep(0.2)
     finally:

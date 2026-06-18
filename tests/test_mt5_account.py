@@ -33,7 +33,7 @@ except ImportError:
     print("FIX:   pip install metaapi-cloud-sdk")
     sys.exit(2)
 
-REQUIRED_SYMBOLS       = ["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "XAUUSD", "BTCUSD"]
+REQUIRED_SYMBOLS       = ["EURUSD", "GBPUSD"]
 EXPECTED_SERVER_SUBSTR = "VTMarkets"
 DIVIDER                = "-" * 52
 

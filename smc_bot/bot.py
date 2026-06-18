@@ -475,34 +475,64 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         return
     log.info("CHoCH confirmed (%s)", bias)
 
-    # ── STEPS 11-12: 5M OB/FVG — retrace into OB after CHoCH ────────────────
-    # Diagrams (both bullish and bearish): after CHoCH the entry is at the OB
-    # zone formed by the displacement (with FVG above/overlapping as confluence).
-    # Rule: price must retrace into the 5M OB specifically. FVG-only retraces
-    # are not valid entries per the diagram rule.
-    ltf_zones = poi.get_ltf_pois(
-        df_5m, bias, sweep["bar_idx"],
-        displacement_atr = disp_atr,
-        lookback         = lc.get("ltf_poi_lookback", 15),
-    )
+    # ── STEPS 11-12: LTF FVG/OB — retrace into owned zone after CHoCH ────────
+    # fvg_retest_enabled (config):
+    #   True  → use poi.get_owned_fvg() to find the specific FVG created by the
+    #            displacement in [sweep_bar+1, choch_bar-1] (pre-CHoCH window).
+    #            Entry fires only when price is inside that exact FVG.
+    #   False → OB retrace from get_ltf_pois() (prior behaviour).
+    fvg_retest     = lc.get("fvg_retest_enabled", False)
     ltf_entry_zone = None
-    if ltf_zones:
-        ltf_entry_zone = poi.ob_for_price(price, ltf_zones)
-        ltf_fvg_ok = poi.has_fvg(ltf_zones)
-        if ltf_entry_zone is None:
+
+    if fvg_retest:
+        # choch_bar is the last confirmed bar in df_5m (n-2 so FVG at n-1 is accessible)
+        choch_bar_idx = len(df_5m) - 2
+        owned_fvg = poi.get_owned_fvg(
+            df_5m, bias,
+            sweep_bar     = sweep["bar_idx"],
+            choch_bar     = choch_bar_idx,
+            displacement_atr = disp_atr,
+        )
+        if owned_fvg is None:
             log.info(
-                "CHoCH confirmed but price %.2f not in 5M OB — waiting for OB retrace "
-                "(5M FVG present: %s)",
-                price, ltf_fvg_ok,
+                "CHoCH confirmed but no owned %s FVG found in [sweep→CHoCH] window — waiting",
+                ltf_lbl,
             )
             return
+        if not (owned_fvg["low"] <= price <= owned_fvg["high"]):
+            log.info(
+                "Owned %s FVG [%.2f – %.2f] found, price %.2f not yet in zone — waiting for retest",
+                ltf_lbl, owned_fvg["low"], owned_fvg["high"], price,
+            )
+            return
+        ltf_entry_zone = owned_fvg
         log.info(
-            "Price in 5M OB [%.2f – %.2f] | FVG confluence: %s — entry triggered",
-            ltf_entry_zone["low"], ltf_entry_zone["high"],
-            "YES" if ltf_fvg_ok else "NO",
+            "Price in owned %s FVG [%.2f – %.2f] — FVG retest entry triggered",
+            ltf_lbl, owned_fvg["low"], owned_fvg["high"],
         )
     else:
-        log.info("No 5M OB/FVG detected (fast move); proceeding to market entry")
+        ltf_zones = poi.get_ltf_pois(
+            df_5m, bias, sweep["bar_idx"],
+            displacement_atr = disp_atr,
+            lookback         = lc.get("ltf_poi_lookback", 15),
+        )
+        if ltf_zones:
+            ltf_entry_zone = poi.ob_for_price(price, ltf_zones)
+            ltf_fvg_ok = poi.has_fvg(ltf_zones)
+            if ltf_entry_zone is None:
+                log.info(
+                    "CHoCH confirmed but price %.2f not in %s OB — waiting for OB retrace "
+                    "(FVG present: %s)",
+                    price, ltf_lbl, ltf_fvg_ok,
+                )
+                return
+            log.info(
+                "Price in %s OB [%.2f – %.2f] | FVG confluence: %s — entry triggered",
+                ltf_lbl, ltf_entry_zone["low"], ltf_entry_zone["high"],
+                "YES" if ltf_fvg_ok else "NO",
+            )
+        else:
+            log.info("No %s OB/FVG detected (fast move); proceeding to market entry", ltf_lbl)
 
     # ── STEP 13: SL below/above sweep wick ───────────────────────────────────
     buf = rc["sl_buffer"]
