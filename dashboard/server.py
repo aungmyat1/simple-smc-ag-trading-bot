@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import uvicorn
 import yaml
 from dotenv import load_dotenv
@@ -1648,6 +1649,841 @@ def _checklist_html() -> str:
     </div>"""
 
 
+# ── Forex charts (SMC 4H→1H + Asian Session) ─────────────────────────────────
+
+FOREX_PAIRS = ["EURUSD", "GBPUSD"]
+FOREX_HTF   = "240m"   # 4H  — bias + POI
+FOREX_LTF   = "60m"    # 1H  — sweep + CHoCH / session box
+
+_FOREX_CFG: dict = {
+    "structure": {"swing_n": 3},
+    "fib":       {"level": 0.5},
+    "poi": {
+        "ob_lookback": 60, "fvg_lookback": 30,
+        "displacement_atr": 1.0,
+        "mitigation_enabled": False, "mitigation_pct": 50, "mitigation_mode": "wick",
+    },
+    "liquidity": {
+        "swing_n": 2, "lookback": 20, "displacement_atr": 1.0,
+        "ltf_poi_lookback": 15, "fvg_retest_enabled": False, "fvg_retest_lookforward": 20,
+    },
+    "confirmation": {"lookback": 8},
+    "targets": {"equal_level_tolerance": 0.0005, "min_r": 1.5, "fallback_r": 3.0},
+    "risk":    {"sl_buffer": 0.0002, "target_r": 3.0},
+    "session": {
+        "asian": {
+            "start_h": 0, "end_h": 8,
+            "range_thr": 0.5, "trend_thr": 0.7,
+            "sweep_beyond_pct": 0.002, "sl_pct_of_range": 0.25,
+            "target_r": 5.0, "trend_first_close_r": 4.0, "first_close_pct": 0.75,
+        }
+    },
+}
+
+
+def _load_forex(symbol: str, tf: str):
+    p = ROOT / "data" / "cache" / f"{symbol}_{tf}.parquet"
+    if not p.exists():
+        return None
+    try:
+        return pd.read_parquet(p)
+    except Exception:
+        return None
+
+
+def _px5(v) -> str:
+    try:   return f"{float(v):.5f}"
+    except: return str(v)
+
+
+def _analyze_smc_forex(df4h, df1h, symbol: str) -> dict:
+    try:
+        cfg     = _FOREX_CFG
+        price   = float(df1h["close"].iloc[-1])
+        swing_n = cfg["structure"]["swing_n"]
+        bias    = structure.get_bias(df4h, swing_n=swing_n)
+
+        fib_mid = fib_mod.get_fib_midpoint(df4h, bias, swing_n=swing_n) if bias != "neutral" else None
+        fib_ok  = fib_mod.fib_filter(price, bias, fib_mid) if fib_mid else False
+
+        swing_high = swing_low = None
+        if bias != "neutral":
+            sh = structure._swing_highs(df4h["high"].values, swing_n)
+            sl = structure._swing_lows(df4h["low"].values, swing_n)
+            if sh: swing_high = float(df4h["high"].values[sh[-1]])
+            if sl: swing_low  = float(df4h["low"].values[sl[-1]])
+
+        tc         = cfg["targets"]
+        bsl_levels = tgt_mod.get_bsl_levels(df4h, swing_n=swing_n, tolerance=tc["equal_level_tolerance"]) if bias != "neutral" else []
+        ssl_levels = tgt_mod.get_ssl_levels(df4h, swing_n=swing_n, tolerance=tc["equal_level_tolerance"]) if bias != "neutral" else []
+
+        pc       = cfg["poi"]
+        poi_raw  = poi.get_pois(df4h, bias, ob_lookback=pc["ob_lookback"],
+                                fvg_lookback=pc["fvg_lookback"],
+                                displacement_atr=pc["displacement_atr"]) if bias != "neutral" else []
+        poi_zones  = [{"kind": z["kind"], "low": float(z["low"]), "high": float(z["high"])} for z in poi_raw]
+        active_poi = poi.price_in_poi(price, poi_zones) if poi_zones else None
+
+        nearest_poi, nearest_dist = None, float("inf")
+        if poi_zones and not active_poi:
+            for z in poi_zones:
+                d = abs(price - (z["low"] + z["high"]) / 2)
+                if d < nearest_dist: nearest_dist, nearest_poi = d, z
+
+        lc    = cfg["liquidity"]
+        sweep = liquidity.get_sweep(df1h, bias, lookback=lc["lookback"],
+                                    swing_n=lc["swing_n"]) if bias != "neutral" else None
+
+        displacement = False
+        if sweep:
+            displacement = liquidity.check_displacement(df1h, sweep["bar_idx"], bias,
+                                                        atr_mult=lc["displacement_atr"])
+
+        choch_ref = None; choch = False
+        if sweep:
+            sb = sweep["bar_idx"]; lb = cfg["confirmation"]["lookback"]
+            rs = max(0, sb - lb)
+            if bias == "bullish":
+                choch_ref = float(np.max(df1h["high"].values[rs:sb + 1]))
+            else:
+                choch_ref = float(np.min(df1h["low"].values[rs:sb + 1]))
+            choch = bool(confirmation.get_choch(df1h, bias, sweep, lookback=lb))
+
+        if bias == "neutral":      stage, blocker = 0, "No clear 4H structure (need HH+HL or LL+LH)"
+        elif not fib_ok or not active_poi: stage, blocker = 1, "Waiting for Fib + 4H POI"
+        elif not sweep:            stage, blocker = 2, "In POI — watching for 1H sweep"
+        elif not displacement:     stage, blocker = 3, "Sweep confirmed — waiting for displacement"
+        elif not choch:            stage, blocker = 4, "Displacement — waiting for 1H CHoCH"
+        else:                      stage, blocker = 5, None
+
+        signal = ("LONG" if bias == "bullish" else "SHORT") if stage == 5 else "FLAT"
+
+        return {
+            "ok": True, "symbol": symbol, "price": price, "bias": bias,
+            "fib_mid": fib_mid, "fib_ok": fib_ok,
+            "poi_zones": poi_zones, "active_poi": active_poi, "nearest_poi": nearest_poi,
+            "poi_count": len(poi_zones), "in_poi": bool(active_poi),
+            "poi_kind": active_poi["kind"] if active_poi else None,
+            "sweep": bool(sweep),
+            "sweep_bar": int(sweep["bar_idx"]) if sweep else None,
+            "sweep_level": float(sweep["swept_level"]) if sweep else None,
+            "sweep_wick": float(sweep["wick_extreme"]) if sweep else None,
+            "displacement": displacement, "choch": bool(choch), "choch_ref_level": choch_ref,
+            "signal": signal, "stage": stage, "blocker": blocker,
+            "swing_high": swing_high, "swing_low": swing_low,
+            "bsl_levels": bsl_levels, "ssl_levels": ssl_levels,
+        }
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        return {"ok": False, "symbol": symbol, "error": str(exc), "price": 0,
+                "bias": "—", "signal": "—", "stage": 0, "poi_zones": [],
+                "sweep": False, "displacement": False, "choch": False}
+
+
+def _analyze_session_forex(df4h, df1h, symbol: str) -> dict:
+    try:
+        from smc_bot import session_range as sr
+        cfg   = _FOREX_CFG
+        ac    = cfg["session"]["asian"]
+        price = float(df1h["close"].iloc[-1])
+        box   = sr._most_recent_completed_box(df1h, start_h=ac["start_h"], end_h=ac["end_h"])
+        if box is None:
+            return {"ok": True, "symbol": symbol, "price": price,
+                    "box": None, "label": "—", "sweep": None, "signal": None}
+        label  = sr.classify_session(box, df1h, range_thr=ac["range_thr"], trend_thr=ac["trend_thr"])
+        sweep  = sr.detect_sweep_in_session(df1h, box, sweep_beyond_pct=ac["sweep_beyond_pct"])
+        signal = sr.build_session_signal(df4h, df1h, cfg)
+        return {
+            "ok": True, "symbol": symbol, "price": price,
+            "box": {"high": box.high, "low": box.low, "range": box.range, "date": box.date},
+            "label": label, "sweep": sweep, "signal": signal,
+        }
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        return {"ok": False, "symbol": symbol, "error": str(exc), "price": 0,
+                "box": None, "label": "—", "sweep": None, "signal": None}
+
+
+def _render_forex_smc_svg(df1h, pipe: dict) -> str:
+    """1H candle chart with 4H OB/FVG zones, fib levels, BSL/SSL, sweep+CHoCH annotations."""
+    N   = 60
+    df  = df1h.tail(N).reset_index(drop=True)
+    n   = len(df)
+    bias = pipe.get("bias", "neutral")
+    sym  = pipe.get("symbol", "")
+
+    W, H          = 1020, 430
+    ML, MR, MT, MB = 68, 200, 44, 34
+    CW = W - ML - MR
+    CH = H - MT - MB
+
+    p_hi = float(df["high"].max())
+    p_lo = float(df["low"].min())
+    extras = []
+    for z in pipe.get("poi_zones", []):
+        extras += [z["low"], z["high"]]
+    for k in ("sweep_level", "sweep_wick", "choch_ref_level", "swing_high", "swing_low", "fib_mid"):
+        v = pipe.get(k)
+        if v: extras.append(v)
+    for lvl in pipe.get("bsl_levels", []) + pipe.get("ssl_levels", []):
+        extras.append(lvl)
+    if extras:
+        p_hi = max(p_hi, max(e for e in extras if e > 0))
+        p_lo = min(p_lo, min(e for e in extras if e > 0))
+
+    pad   = (p_hi - p_lo) * 0.16
+    p_max = p_hi + pad
+    p_min = p_lo - pad
+    p_rng = p_max - p_min if p_max != p_min else 1e-10
+
+    def py(price: float) -> float:
+        return MT + CH * (1.0 - (float(price) - p_min) / p_rng)
+
+    def px(i: int) -> float:
+        return ML + CW * i / max(n - 1, 1)
+
+    bw  = max(4.5, CW / n * 0.62)
+    bhw = bw / 2
+    o: list[str] = []
+
+    o.append(f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
+             f'style="width:100%;height:auto;display:block;background:#0d1117;border-radius:6px">')
+
+    # Grid lines (5 levels)
+    for pct in (0.15, 0.35, 0.5, 0.65, 0.85):
+        yg = MT + CH * pct
+        pg = p_max - p_rng * pct
+        o.append(f'<line x1="{ML}" y1="{yg:.1f}" x2="{ML+CW}" y2="{yg:.1f}" stroke="#1c2230" stroke-width="1"/>')
+        o.append(f'<text x="{ML-4}" y="{yg+4:.1f}" text-anchor="end" fill="#3d4a5a" font-family="monospace" font-size="9">{pg:.5f}</text>')
+    o.append(f'<rect x="{ML}" y="{MT}" width="{CW}" height="{CH}" fill="none" stroke="#1c2230" stroke-width="1"/>')
+
+    # Dealing range (swing high → mid → swing low)
+    s_hi  = pipe.get("swing_high")
+    s_lo  = pipe.get("swing_low")
+    f_mid = pipe.get("fib_mid")
+    if s_hi and s_lo and s_hi > s_lo:
+        ysh  = py(s_hi); ysl = py(s_lo)
+        ymid = py(f_mid) if f_mid else (ysh + ysl) / 2
+        if ymid > ysh:
+            o.append(f'<rect x="{ML}" y="{ymid:.1f}" width="{CW}" height="{max(1,ysl-ymid):.1f}" fill="#0a1f0a" opacity="0.5"/>')
+            o.append(f'<text x="{ML+CW-4}" y="{(ymid+ysl)/2+4:.1f}" text-anchor="end" fill="#204a20" font-family="monospace" font-size="9" font-weight="600" opacity="0.85">DISCOUNT</text>')
+            o.append(f'<rect x="{ML}" y="{ysh:.1f}" width="{CW}" height="{max(1,ymid-ysh):.1f}" fill="#1f0a0a" opacity="0.5"/>')
+            o.append(f'<text x="{ML+CW-4}" y="{(ysh+ymid)/2+4:.1f}" text-anchor="end" fill="#4a2020" font-family="monospace" font-size="9" font-weight="600" opacity="0.85">PREMIUM</text>')
+        o.append(f'<line x1="{ML}" y1="{ysh:.1f}" x2="{ML+CW}" y2="{ysh:.1f}" stroke="#7a3030" stroke-width="1.2" stroke-dasharray="8,4"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{ysh+4:.1f}" fill="#c05050" font-family="monospace" font-size="8.5">Swing H</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{ysh+14:.1f}" fill="#804040" font-family="monospace" font-size="8">{s_hi:.5f}</text>')
+        o.append(f'<line x1="{ML}" y1="{ysl:.1f}" x2="{ML+CW}" y2="{ysl:.1f}" stroke="#207a30" stroke-width="1.2" stroke-dasharray="8,4"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{ysl+4:.1f}" fill="#40c060" font-family="monospace" font-size="8.5">Swing L</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{ysl+14:.1f}" fill="#408050" font-family="monospace" font-size="8">{s_lo:.5f}</text>')
+        if f_mid:
+            o.append(f'<line x1="{ML}" y1="{ymid:.1f}" x2="{ML+CW}" y2="{ymid:.1f}" stroke="#6060a0" stroke-width="1" stroke-dasharray="4,4"/>')
+            o.append(f'<text x="{ML+CW+6}" y="{ymid+4:.1f}" fill="#8888cc" font-family="monospace" font-size="8.5">50% Mid</text>')
+            o.append(f'<text x="{ML+CW+6}" y="{ymid+14:.1f}" fill="#6060a0" font-family="monospace" font-size="8">{f_mid:.5f}</text>')
+
+    # 4H POI zones (FVGs first, OBs on top)
+    cur_p = pipe.get("price") or float(df["close"].iloc[-1])
+    chart_zones = []
+    for z in pipe.get("poi_zones", []):
+        if z["kind"] == "OB":
+            chart_zones.append(z)
+        else:
+            mid = (z["low"] + z["high"]) / 2
+            if cur_p and abs(mid - cur_p) / (cur_p or 1) <= 0.005:
+                chart_zones.append(z)
+
+    for z in [z for z in chart_zones if z["kind"] == "FVG"]:
+        zy1 = py(z["high"]); zy2 = py(z["low"]); zh = max(1.0, zy2 - zy1)
+        o.append(f'<rect x="{ML}" y="{zy1:.1f}" width="{CW}" height="{zh:.1f}" fill="#1c1205" stroke="#6a5010" stroke-width="0.8" opacity="0.6"/>')
+        o.append(f'<text x="{ML+6}" y="{(zy1+zy2)/2+4:.1f}" fill="#c8950a" font-family="monospace" font-size="9" opacity="0.85">FVG</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{zy1+10:.1f}" fill="#9a7010" font-family="monospace" font-size="8">{z["high"]:.5f}</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{zy2+1:.1f}" fill="#9a7010" font-family="monospace" font-size="8">{z["low"]:.5f}</text>')
+
+    for z in [z for z in chart_zones if z["kind"] == "OB"]:
+        zy1 = py(z["high"]); zy2 = py(z["low"]); zh = max(2.0, zy2 - zy1)
+        mid_y = (zy1 + zy2) / 2
+        is_active = (pipe.get("active_poi") is not None and
+                     pipe["active_poi"].get("low") == z["low"] and
+                     pipe["active_poi"].get("high") == z["high"])
+        fill   = ("#0d3a66" if is_active else "#0a2848") if bias == "bullish" else ("#3d0e1a" if is_active else "#2a0a12")
+        stroke = ("#3a96ff" if is_active else "#2472c8") if bias == "bullish" else ("#ff3a5a" if is_active else "#c02840")
+        lbl    = "#4a9eff" if bias == "bullish" else "#ff6070"
+        op     = "1.0" if is_active else "0.82"
+        mark   = " ◀" if is_active else ""
+        o.append(f'<rect x="{ML}" y="{zy1:.1f}" width="{CW}" height="{zh:.1f}" fill="{fill}" stroke="{stroke}" stroke-width="1" opacity="{op}"/>')
+        o.append(f'<rect x="{ML}" y="{zy1:.1f}" width="3" height="{zh:.1f}" fill="{stroke}" opacity="{op}"/>')
+        label_y = max(zy1 + 12, min(zy2 - 3, mid_y + 4))
+        o.append(f'<text x="{ML+7}" y="{label_y:.1f}" fill="{lbl}" font-family="monospace" font-size="10" font-weight="bold" opacity="0.95">OB{mark}</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{mid_y:.1f}" fill="{lbl}" font-family="monospace" font-size="9" font-weight="bold">OB</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{zy1+10:.1f}" fill="{stroke}" font-family="monospace" font-size="8">{z["high"]:.5f}</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{zy2-2:.1f}" fill="{stroke}" font-family="monospace" font-size="8">{z["low"]:.5f}</text>')
+
+    # BSL / SSL pools (nearest 4)
+    bsl_near = sorted(pipe.get("bsl_levels", []), key=lambda v: abs(v - cur_p))[:4]
+    ssl_near = sorted(pipe.get("ssl_levels", []), key=lambda v: abs(v - cur_p))[:4]
+    _liq_bias = pipe.get("bias", "neutral")
+    tp_pool = None
+    if _liq_bias == "bullish":
+        c = [v for v in bsl_near if v > cur_p]; tp_pool = min(c) if c else None
+    elif _liq_bias == "bearish":
+        c = [v for v in ssl_near if v < cur_p]; tp_pool = max(c) if c else None
+
+    for lvl in bsl_near:
+        yl = py(lvl); is_tp = tp_pool is not None and abs(lvl - tp_pool) < 0.0001
+        col  = "#ffcc44" if is_tp else "#ffa040"; sw = "1.6" if is_tp else "1"
+        dash = "0" if is_tp else "5,4"; lbl_t = "BSL ● TP" if is_tp else "BSL"
+        o.append(f'<line x1="{ML}" y1="{yl:.1f}" x2="{ML+CW}" y2="{yl:.1f}" stroke="{col}" stroke-width="{sw}" stroke-dasharray="{dash}" opacity="0.75"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{yl+4:.1f}" fill="{col}" font-family="monospace" font-size="8.5" font-weight="{"bold" if is_tp else "normal"}">{lbl_t}</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{yl+14:.1f}" fill="#a06820" font-family="monospace" font-size="8">{lvl:.5f}</text>')
+
+    for lvl in ssl_near:
+        yl = py(lvl); is_tp = tp_pool is not None and abs(lvl - tp_pool) < 0.0001
+        col  = "#44ddff" if is_tp else "#40a0d0"; sw = "1.6" if is_tp else "1"
+        dash = "0" if is_tp else "5,4"; lbl_t = "SSL ● TP" if is_tp else "SSL"
+        o.append(f'<line x1="{ML}" y1="{yl:.1f}" x2="{ML+CW}" y2="{yl:.1f}" stroke="{col}" stroke-width="{sw}" stroke-dasharray="{dash}" opacity="0.75"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{yl+4:.1f}" fill="{col}" font-family="monospace" font-size="8.5" font-weight="{"bold" if is_tp else "normal"}">{lbl_t}</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{yl+14:.1f}" fill="#207090" font-family="monospace" font-size="8">{lvl:.5f}</text>')
+
+    # Sweep level
+    sl_v = pipe.get("sweep_level")
+    if sl_v:
+        ys = py(sl_v)
+        o.append(f'<line x1="{ML}" y1="{ys:.1f}" x2="{ML+CW}" y2="{ys:.1f}" stroke="#7a8a9a" stroke-width="1" stroke-dasharray="6,4"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{ys+4:.1f}" fill="#7a8a9a" font-family="monospace" font-size="8.5">Swept liq.</text>')
+
+    # SL / TP projected lines
+    sw_wk = pipe.get("sweep_wick")
+    sl_p = tp_p = None
+    if sw_wk and cur_p:
+        buf = _FOREX_CFG["risk"]["sl_buffer"]
+        r_  = _FOREX_CFG["risk"]["target_r"]
+        if bias == "bullish":
+            sl_p = sw_wk * (1 - buf); tp_p = cur_p + abs(cur_p - sl_p) * r_
+        else:
+            sl_p = sw_wk * (1 + buf); tp_p = cur_p - abs(cur_p - sl_p) * r_
+    if tp_p:
+        yt = py(tp_p)
+        o.append(f'<line x1="{ML}" y1="{yt:.1f}" x2="{ML+CW}" y2="{yt:.1f}" stroke="#3fb950" stroke-width="1" stroke-dasharray="5,4"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{yt+4:.1f}" fill="#3fb950" font-family="monospace" font-size="8.5">Take profit</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{yt+15:.1f}" fill="#308040" font-family="monospace" font-size="8">{tp_p:.5f}</text>')
+    if sl_p:
+        ys2 = py(sl_p)
+        o.append(f'<line x1="{ML}" y1="{ys2:.1f}" x2="{ML+CW}" y2="{ys2:.1f}" stroke="#f85149" stroke-width="1" stroke-dasharray="4,3"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{ys2+4:.1f}" fill="#f85149" font-family="monospace" font-size="8.5">Stop loss</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{ys2+15:.1f}" fill="#c04040" font-family="monospace" font-size="8">{sl_p:.5f}</text>')
+
+    # CHoCH reference
+    choch_ref = pipe.get("choch_ref_level")
+    if choch_ref:
+        yc = py(choch_ref); confirmed = pipe.get("choch", False)
+        col  = "#3fb950" if confirmed else "#a0a0a0"
+        dash = "8,3" if confirmed else "6,5"
+        lbl  = "CHoCH ✓" if confirmed else "CHoCH"
+        o.append(f'<line x1="{ML}" y1="{yc:.1f}" x2="{ML+CW}" y2="{yc:.1f}" stroke="{col}" stroke-width="1.2" stroke-dasharray="{dash}"/>')
+        o.append(f'<text x="{ML+CW+6}" y="{yc+4:.1f}" fill="{col}" font-family="monospace" font-size="9" font-weight="bold">{lbl}</text>')
+
+    # Candlesticks
+    sweep_bar_idx = pipe.get("sweep_bar")
+    for i in range(n):
+        row  = df.iloc[i]
+        cx   = px(i)
+        op_, hi_, lo_, cl_ = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+        bull = cl_ >= op_
+        col  = "#3fb950" if bull else "#f85149"
+        body_top = py(max(op_, cl_)); body_bot = py(min(op_, cl_))
+        body_h   = max(1.0, body_bot - body_top)
+        o.append(f'<line x1="{cx:.1f}" y1="{py(hi_):.1f}" x2="{cx:.1f}" y2="{py(lo_):.1f}" stroke="{col}" stroke-width="1" opacity="0.85"/>')
+        o.append(f'<rect x="{cx-bhw:.1f}" y="{body_top:.1f}" width="{bw:.1f}" height="{body_h:.1f}" fill="{col}" rx="0.5"/>')
+        if sweep_bar_idx is not None and i == (sweep_bar_idx if sweep_bar_idx < n else n - 1):
+            if bias == "bullish":
+                my = py(lo_) + 14
+                o.append(f'<text x="{cx:.1f}" y="{my:.1f}" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="bold">▼</text>')
+                o.append(f'<text x="{cx:.1f}" y="{my+11:.1f}" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="7.5">Sweep</text>')
+            else:
+                my = py(hi_) - 14
+                o.append(f'<text x="{cx:.1f}" y="{my:.1f}" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="bold">▲</text>')
+                o.append(f'<text x="{cx:.1f}" y="{my-3:.1f}" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="7.5">Sweep</text>')
+
+    # Current price line
+    if cur_p:
+        yp = py(cur_p)
+        o.append(f'<line x1="{ML}" y1="{yp:.1f}" x2="{ML+CW}" y2="{yp:.1f}" stroke="#4a8aff" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>')
+        o.append(f'<rect x="{ML+CW-1}" y="{yp-9:.1f}" width="90" height="16" fill="#1a2f60" rx="2"/>')
+        o.append(f'<text x="{ML+CW+44:.1f}" y="{yp+4:.1f}" text-anchor="middle" fill="#6ab0ff" font-family="monospace" font-size="9" font-weight="bold">{cur_p:.5f}</text>')
+
+    # Bias badge
+    bcol = {"bullish": "#3fb950", "bearish": "#f85149"}.get(bias, "#6e7681")
+    blbl = {"bullish": "4H Bias: BULLISH", "bearish": "4H Bias: BEARISH"}.get(bias, "4H Bias: NEUTRAL")
+    bsub = "4H HH+HL" if bias == "bullish" else "4H LL+LH" if bias == "bearish" else "no clear structure"
+    o.append(f'<rect x="{ML+6}" y="{MT+5}" width="155" height="35" rx="5" fill="#161b22" stroke="{bcol}" stroke-width="1.5" opacity="0.95"/>')
+    o.append(f'<text x="{ML+14}" y="{MT+19}" fill="{bcol}" font-family="monospace" font-size="11" font-weight="bold">{blbl}</text>')
+    o.append(f'<text x="{ML+14}" y="{MT+31}" fill="#4a5a6a" font-family="monospace" font-size="8.5">{bsub}</text>')
+
+    # Stage badge
+    stage      = pipe.get("stage", 0)
+    stage_lbl  = f"Stage {stage}/5 · {['NO BIAS','BIAS','FIB+POI','SWEEP','DISP','SIGNAL'][min(stage,5)]}"
+    scol       = ["#4a5568","#d29922","#e3b341","#58a6ff","#c97dff","#3fb950"][min(stage, 5)]
+    o.append(f'<rect x="{ML+CW-145}" y="{MT+5}" width="143" height="22" rx="4" fill="#161b22" stroke="{scol}" stroke-width="1" opacity="0.95"/>')
+    o.append(f'<text x="{ML+CW-72}" y="{MT+18}" text-anchor="middle" fill="{scol}" font-family="monospace" font-size="9" font-weight="bold">{stage_lbl}</text>')
+
+    o.append(f'<text x="{W//2}" y="{H-6}" text-anchor="middle" fill="#3d4a5a" font-family="monospace" font-size="9">{sym} · 1H (last {n} bars, 4H OB/FVG zones)</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def _render_forex_session_svg(df1h, sess: dict) -> str:
+    """1H candle chart with Asian session box, sweep marker, and signal lines."""
+    N   = 48    # last 2 days of 1H bars
+    df  = df1h.tail(N).reset_index(drop=True)
+    n   = len(df)
+    sym = sess.get("symbol", "")
+
+    W, H          = 1020, 430
+    ML, MR, MT, MB = 68, 200, 44, 34
+    CW = W - ML - MR
+    CH = H - MT - MB
+
+    # Build extras list
+    box = sess.get("box")
+    sig = sess.get("signal")
+
+    p_hi = float(df["high"].max())
+    p_lo = float(df["low"].min())
+    extras = []
+    if box:
+        extras += [box["high"], box["low"]]
+    if sig:
+        for attr in ("entry", "sl", "tp"):
+            v = getattr(sig, attr, None)
+            if v: extras.append(v)
+    if extras:
+        p_hi = max(p_hi, max(extras))
+        p_lo = min(p_lo, min(extras))
+
+    pad   = (p_hi - p_lo) * 0.18
+    p_max = p_hi + pad
+    p_min = p_lo - pad
+    p_rng = p_max - p_min if p_max != p_min else 1e-10
+    price = sess.get("price", 0)
+
+    def py(v: float) -> float:
+        return MT + CH * (1.0 - (float(v) - p_min) / p_rng)
+
+    def px(i: int) -> float:
+        return ML + CW * i / max(n - 1, 1)
+
+    bw  = max(4.5, CW / n * 0.62)
+    bhw = bw / 2
+    o: list[str] = []
+    o.append(f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
+             f'style="width:100%;height:auto;display:block;background:#0d1117;border-radius:6px">')
+
+    # Grid
+    for pct in (0.15, 0.35, 0.5, 0.65, 0.85):
+        yg = MT + CH * pct
+        pg = p_max - p_rng * pct
+        o.append(f'<line x1="{ML}" y1="{yg:.1f}" x2="{ML+CW}" y2="{yg:.1f}" stroke="#1c2230" stroke-width="1"/>')
+        o.append(f'<text x="{ML-4}" y="{yg+4:.1f}" text-anchor="end" fill="#3d4a5a" font-family="monospace" font-size="9">{pg:.5f}</text>')
+    o.append(f'<rect x="{ML}" y="{MT}" width="{CW}" height="{CH}" fill="none" stroke="#1c2230" stroke-width="1"/>')
+
+    # Shade bars that fall within Asian session hours (UTC 00–08)
+    if len(df) > 0 and "ts" in df.columns:
+        ts_arr = pd.to_datetime(df["ts"].values, utc=True)
+        for i, ts in enumerate(ts_arr):
+            if 0 <= ts.hour < 8:
+                bx = px(i) - bhw * 1.4
+                bx_w = bw * 2.2
+                o.append(f'<rect x="{bx:.1f}" y="{MT}" width="{bx_w:.1f}" height="{CH}" fill="#1a1a2e" opacity="0.4"/>')
+
+    # Session box (horizontal band)
+    if box:
+        yh = py(box["high"]); yl = py(box["low"]); bh = max(2, yl - yh)
+        o.append(f'<rect x="{ML}" y="{yh:.1f}" width="{CW}" height="{bh:.1f}" fill="#1a1a35" stroke="#4040cc" stroke-width="1" opacity="0.7"/>')
+        o.append(f'<line x1="{ML}" y1="{yh:.1f}" x2="{ML+CW}" y2="{yh:.1f}" stroke="#6060ee" stroke-width="1.5" stroke-dasharray="10,4"/>')
+        o.append(f'<line x1="{ML}" y1="{yl:.1f}" x2="{ML+CW}" y2="{yl:.1f}" stroke="#6060ee" stroke-width="1.5" stroke-dasharray="10,4"/>')
+
+        label = sess.get("label", "—")
+        label_col = {"trend": "#e3b341", "range": "#58a6ff", "neutral": "#6e7681"}.get(label, "#a0a0a0")
+        box_mid_y  = (yh + yl) / 2
+        o.append(f'<text x="{ML+8}" y="{box_mid_y+4:.1f}" fill="{label_col}" font-family="monospace" font-size="11" font-weight="bold" opacity="0.9">Asian Box · {label.upper()}</text>')
+        o.append(f'<text x="{ML+8}" y="{box_mid_y+17:.1f}" fill="#4a5a6a" font-family="monospace" font-size="8.5">{box["date"]} · range={box["range"]:.5f}</text>')
+
+        o.append(f'<text x="{ML+CW+6}" y="{yh+4:.1f}" fill="#8080ff" font-family="monospace" font-size="8.5">Box H</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{yh+14:.1f}" fill="#6060cc" font-family="monospace" font-size="8">{box["high"]:.5f}</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{yl+4:.1f}" fill="#8080ff" font-family="monospace" font-size="8.5">Box L</text>')
+        o.append(f'<text x="{ML+CW+6}" y="{yl+14:.1f}" fill="#6060cc" font-family="monospace" font-size="8">{box["low"]:.5f}</text>')
+
+    # Signal lines (entry, SL, TP)
+    if sig:
+        entry = getattr(sig, "entry", None)
+        sl    = getattr(sig, "sl", None)
+        tp    = getattr(sig, "tp", None)
+        side  = getattr(sig, "side", "Buy")
+        setup = getattr(sig, "setup", "—")
+        if entry:
+            ye = py(entry)
+            ecol = "#3fb950" if side == "Buy" else "#f85149"
+            arr  = "▲" if side == "Buy" else "▼"
+            o.append(f'<line x1="{ML}" y1="{ye:.1f}" x2="{ML+CW}" y2="{ye:.1f}" stroke="{ecol}" stroke-width="1.8" stroke-dasharray="6,3"/>')
+            o.append(f'<text x="{ML+CW+6}" y="{ye+4:.1f}" fill="{ecol}" font-family="monospace" font-size="9" font-weight="bold">{arr} Entry ({setup})</text>')
+            o.append(f'<text x="{ML+CW+6}" y="{ye+15:.1f}" fill="{ecol}" font-family="monospace" font-size="8">{entry:.5f}</text>')
+        if sl:
+            ysl2 = py(sl)
+            o.append(f'<line x1="{ML}" y1="{ysl2:.1f}" x2="{ML+CW}" y2="{ysl2:.1f}" stroke="#f85149" stroke-width="1" stroke-dasharray="4,3"/>')
+            o.append(f'<text x="{ML+CW+6}" y="{ysl2+4:.1f}" fill="#f85149" font-family="monospace" font-size="8.5">Stop loss</text>')
+            o.append(f'<text x="{ML+CW+6}" y="{ysl2+14:.1f}" fill="#c04040" font-family="monospace" font-size="8">{sl:.5f}</text>')
+        if tp:
+            ytp2 = py(tp)
+            o.append(f'<line x1="{ML}" y1="{ytp2:.1f}" x2="{ML+CW}" y2="{ytp2:.1f}" stroke="#3fb950" stroke-width="1" stroke-dasharray="5,4"/>')
+            o.append(f'<text x="{ML+CW+6}" y="{ytp2+4:.1f}" fill="#3fb950" font-family="monospace" font-size="8.5">Take profit</text>')
+            o.append(f'<text x="{ML+CW+6}" y="{ytp2+15:.1f}" fill="#308040" font-family="monospace" font-size="8">{tp:.5f}</text>')
+        if entry and sl:
+            yr1 = py(max(entry, sl)); yr2 = py(min(entry, sl))
+            o.append(f'<rect x="{ML}" y="{yr1:.1f}" width="{CW}" height="{max(1,yr2-yr1):.1f}" fill="#f85149" opacity="0.05"/>')
+        if entry and tp:
+            yr1 = py(max(entry, tp)); yr2 = py(min(entry, tp))
+            o.append(f'<rect x="{ML}" y="{yr1:.1f}" width="{CW}" height="{max(1,yr2-yr1):.1f}" fill="#3fb950" opacity="0.05"/>')
+
+    # Sweep bar marker
+    sweep = sess.get("sweep")
+    if sweep:
+        bar_idx = sweep.get("bar_idx", 0)
+        direction = sweep.get("direction", "bullish")
+        adj_i = bar_idx - (len(df1h) - N)
+        if 0 <= adj_i < n:
+            row = df.iloc[adj_i]; cx = px(adj_i)
+            if direction == "bullish":
+                my = py(float(row["low"])) + 14
+                o.append(f'<text x="{cx:.1f}" y="{my:.1f}" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="bold">▼</text>')
+                o.append(f'<text x="{cx:.1f}" y="{my+11:.1f}" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="7.5">Sweep</text>')
+            else:
+                my = py(float(row["high"])) - 14
+                o.append(f'<text x="{cx:.1f}" y="{my:.1f}" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="bold">▲</text>')
+                o.append(f'<text x="{cx:.1f}" y="{my-3:.1f}" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="7.5">Sweep</text>')
+
+    # Candlesticks
+    for i in range(n):
+        row  = df.iloc[i]
+        cx   = px(i)
+        op_, hi_, lo_, cl_ = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+        bull = cl_ >= op_; col = "#3fb950" if bull else "#f85149"
+        body_top = py(max(op_, cl_)); body_bot = py(min(op_, cl_))
+        body_h   = max(1.0, body_bot - body_top)
+        o.append(f'<line x1="{cx:.1f}" y1="{py(hi_):.1f}" x2="{cx:.1f}" y2="{py(lo_):.1f}" stroke="{col}" stroke-width="1" opacity="0.85"/>')
+        o.append(f'<rect x="{cx-bhw:.1f}" y="{body_top:.1f}" width="{bw:.1f}" height="{body_h:.1f}" fill="{col}" rx="0.5"/>')
+
+    # Current price
+    if price:
+        yp = py(price)
+        o.append(f'<line x1="{ML}" y1="{yp:.1f}" x2="{ML+CW}" y2="{yp:.1f}" stroke="#4a8aff" stroke-width="1" stroke-dasharray="3,3" opacity="0.7"/>')
+        o.append(f'<rect x="{ML+CW-1}" y="{yp-9:.1f}" width="90" height="16" fill="#1a2f60" rx="2"/>')
+        o.append(f'<text x="{ML+CW+44:.1f}" y="{yp+4:.1f}" text-anchor="middle" fill="#6ab0ff" font-family="monospace" font-size="9" font-weight="bold">{price:.5f}</text>')
+
+    # Signal badge
+    sig_txt = "— NO SIGNAL"
+    sig_col = "#6e7681"
+    if sig:
+        side  = getattr(sig, "side", "Buy")
+        setup = getattr(sig, "setup", "—")
+        sig_txt = f"{'▲' if side=='Buy' else '▼'} {'LONG' if side=='Buy' else 'SHORT'} · {setup.upper()}"
+        sig_col = "#3fb950" if side == "Buy" else "#f85149"
+
+    label = sess.get("label", "—")
+    label_col = {"trend": "#e3b341", "range": "#58a6ff", "neutral": "#6e7681"}.get(label, "#a0a0a0")
+    o.append(f'<rect x="{ML+6}" y="{MT+5}" width="170" height="35" rx="5" fill="#161b22" stroke="{label_col}" stroke-width="1.5" opacity="0.95"/>')
+    o.append(f'<text x="{ML+14}" y="{MT+19}" fill="{label_col}" font-family="monospace" font-size="11" font-weight="bold">Session: {label.upper()}</text>')
+    o.append(f'<text x="{ML+14}" y="{MT+31}" fill="{sig_col}" font-family="monospace" font-size="9" font-weight="bold">{sig_txt}</text>')
+
+    o.append(f'<text x="{W//2}" y="{H-6}" text-anchor="middle" fill="#3d4a5a" font-family="monospace" font-size="9">{sym} · 1H · Asian Session Box (00–08 UTC) · last {n} bars</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def _smc_gate_panel(pipe: dict, symbol: str) -> str:
+    """Compact SMC gate summary card for one forex pair."""
+    if not pipe.get("ok"):
+        return f'<div style="color:var(--red);font-size:12px">⚠ {pipe.get("error","")}</div>'
+    bias  = pipe.get("bias", "neutral")
+    price = pipe.get("price", 0)
+    stage = pipe.get("stage", 0)
+    scol  = ["#4a5568","#d29922","#e3b341","#58a6ff","#c97dff","#3fb950"][min(stage, 5)]
+    sig   = pipe.get("signal", "FLAT")
+    sig_cls = {"LONG": "sig-long", "SHORT": "sig-short"}.get(sig, "sig-flat")
+    sig_txt = {"LONG": "▲ LONG", "SHORT": "▼ SHORT", "FLAT": "— FLAT"}[sig]
+    bias_col = {"bullish": "#3fb950", "bearish": "#f85149"}.get(bias, "#6e7681")
+
+    def gate(icon, lbl, val, cls):
+        return (f'<div class="gate">'
+                f'<span class="gate-icon">{icon}</span>'
+                f'<span class="gate-label">{lbl}</span>'
+                f'<span class="gate-value {cls}">{val}</span></div>')
+
+    def gpass(ok): return "gate-pass" if ok else "gate-wait"
+
+    fib_ok  = pipe.get("fib_ok", False)
+    fib_mid = pipe.get("fib_mid")
+    fib_lbl = f'{"discount" if bias=="bullish" else "premium"} ({_px5(fib_mid)})' if fib_mid else "—"
+    poi_lbl = f'in {pipe["poi_kind"]}' if pipe.get("in_poi") else f'{pipe.get("poi_count",0)} zones · not reached'
+
+    return f"""
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">
+        <span style="color:{bias_col};font-weight:700">{bias.upper()}</span>
+        &nbsp;·&nbsp; price {_px5(price)}
+        &nbsp;·&nbsp; <span style="color:{scol};font-weight:600">Stage {stage}/5</span>
+      </div>
+      {gate("✅" if bias!="neutral" else "⬜", "4H Bias", bias.upper(), gpass(bias!="neutral"))}
+      {gate("✅" if fib_ok else "⬜", "Fib Zone", fib_lbl, gpass(fib_ok))}
+      {gate("✅" if pipe.get("in_poi") else "⬜", "4H POI", poi_lbl, gpass(pipe.get("in_poi",False)))}
+      {gate("✅" if pipe.get("sweep") else "⬜", "1H Sweep", f'swept {_px5(pipe.get("sweep_level"))}' if pipe.get("sweep") else "none", gpass(pipe.get("sweep",False)))}
+      {gate("✅" if pipe.get("displacement") else "⬜", "Displace", "confirmed" if pipe.get("displacement") else "pending" if pipe.get("sweep") else "—", gpass(pipe.get("displacement",False)))}
+      {gate("✅" if pipe.get("choch") else "⬜", "1H CHoCH", "confirmed" if pipe.get("choch") else "—", gpass(pipe.get("choch",False)))}
+      <div style="text-align:center;margin-top:10px">
+        <span class="signal-badge {sig_cls}">{sig_txt}</span>
+      </div>
+    </div>"""
+
+
+def _session_panel(sess: dict) -> str:
+    """Compact session status card for one forex pair."""
+    if not sess.get("ok"):
+        return f'<div style="color:var(--red);font-size:12px">⚠ {sess.get("error","")}</div>'
+    box   = sess.get("box")
+    label = sess.get("label", "—")
+    sig   = sess.get("signal")
+    price = sess.get("price", 0)
+    label_col = {"trend": "#e3b341", "range": "#58a6ff", "neutral": "#6e7681"}.get(label, "#a0a0a0")
+
+    def row(lbl, val, col="#c9d1d9"):
+        return (f'<div class="metric">'
+                f'<span class="metric-label">{lbl}</span>'
+                f'<span class="metric-value" style="color:{col}">{val}</span></div>')
+
+    if not box:
+        box_html = '<div style="color:var(--muted);font-size:12px">No completed Asian session box in data.</div>'
+    else:
+        box_range_pips = round(box["range"] / 0.0001, 1)
+        box_html = (
+            row("Session", label.upper(), label_col) +
+            row("Box High", f'{box["high"]:.5f}', "#8080ff") +
+            row("Box Low",  f'{box["low"]:.5f}',  "#8080ff") +
+            row("Box Range", f'{box["range"]:.5f} ({box_range_pips} pips)', "#a0a0c0") +
+            row("Date", box["date"], "#6e7681")
+        )
+
+    sweep = sess.get("sweep")
+    sweep_html = ""
+    if sweep:
+        d = sweep.get("direction", "—")
+        col = "#3fb950" if d == "bullish" else "#f85149"
+        sweep_html = row("Sweep", f'{d.upper()} detected', col)
+
+    sig_html = ""
+    if sig:
+        side  = getattr(sig, "side", "Buy")
+        setup = getattr(sig, "setup", "—")
+        sig_col = "#3fb950" if side == "Buy" else "#f85149"
+        sig_html = (
+            '<div style="border-top:1px solid var(--border);margin:8px 0"></div>' +
+            row("Signal", f'{"▲ LONG" if side=="Buy" else "▼ SHORT"} · {setup}', sig_col) +
+            row("Entry", f'{sig.entry:.5f}', sig_col) +
+            row("SL",    f'{sig.sl:.5f}', "#f85149") +
+            row("TP",    f'{sig.tp:.5f}', "#3fb950") +
+            row("R dist", f'{abs(sig.entry - sig.sl):.5f}', "#a0a0a0")
+        )
+    else:
+        sig_html = '<div style="color:var(--muted);font-size:12px;margin-top:6px">— No active signal</div>'
+
+    return f'{row("Price", f"{price:.5f}", "#6ab0ff")}{box_html}{sweep_html}{sig_html}'
+
+
+def _forex_charts_html() -> str:
+    """
+    Two tabbed chart sections:
+      Tab 1 — SMC Method (4H→1H): EURUSD | GBPUSD sub-tabs
+      Tab 2 — Session Trading (Asian Box): EURUSD | GBPUSD sub-tabs
+    Data loaded from parquet cache — no live API call.
+    """
+    data_eu4h = _load_forex("EURUSD", FOREX_HTF)
+    data_eu1h = _load_forex("EURUSD", FOREX_LTF)
+    data_gb4h = _load_forex("GBPUSD", FOREX_HTF)
+    data_gb1h = _load_forex("GBPUSD", FOREX_LTF)
+
+    if data_eu1h is None or data_eu4h is None:
+        eu_avail = False
+        eu_smc  = {"ok": False, "symbol": "EURUSD", "error": "EURUSD parquet not found — run fetch_forex_data.py"}
+        eu_sess = {"ok": False, "symbol": "EURUSD", "error": "EURUSD parquet not found — run fetch_forex_data.py"}
+    else:
+        eu_avail = True
+        eu_smc  = _analyze_smc_forex(data_eu4h, data_eu1h, "EURUSD")
+        eu_sess = _analyze_session_forex(data_eu4h, data_eu1h, "EURUSD")
+
+    if data_gb1h is None or data_gb4h is None:
+        gb_avail = False
+        gb_smc  = {"ok": False, "symbol": "GBPUSD", "error": "GBPUSD parquet not found — run fetch_forex_data.py"}
+        gb_sess = {"ok": False, "symbol": "GBPUSD", "error": "GBPUSD parquet not found — run fetch_forex_data.py"}
+    else:
+        gb_avail = True
+        gb_smc  = _analyze_smc_forex(data_gb4h, data_gb1h, "GBPUSD")
+        gb_sess = _analyze_session_forex(data_gb4h, data_gb1h, "GBPUSD")
+
+    # Charts
+    eu_smc_svg  = _render_forex_smc_svg(data_eu1h, eu_smc)  if eu_avail else "<p class='red'>No data</p>"
+    gb_smc_svg  = _render_forex_smc_svg(data_gb1h, gb_smc)  if gb_avail else "<p class='red'>No data</p>"
+    eu_sess_svg = _render_forex_session_svg(data_eu1h, eu_sess) if eu_avail else "<p class='red'>No data</p>"
+    gb_sess_svg = _render_forex_session_svg(data_gb1h, gb_sess) if gb_avail else "<p class='red'>No data</p>"
+
+    # Data freshness
+    def _freshness(df):
+        if df is None: return "—"
+        try:
+            ts = pd.to_datetime(df["ts"].iloc[-1], utc=True)
+            return ts.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            return "—"
+
+    eu_fresh = _freshness(data_eu1h)
+    gb_fresh = _freshness(data_gb1h)
+
+    eu_smc_gates  = _smc_gate_panel(eu_smc,  "EURUSD")
+    gb_smc_gates  = _smc_gate_panel(gb_smc,  "GBPUSD")
+    eu_sess_panel = _session_panel(eu_sess)
+    gb_sess_panel = _session_panel(gb_sess)
+
+    return f"""
+<div class="card full-width" style="margin-bottom:12px">
+  <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+    <span>Forex Charts — SMC (4H→1H) &amp; Session Trading</span>
+    <span style="font-size:10px;color:var(--muted)">EURUSD: {eu_fresh} &nbsp;·&nbsp; GBPUSD: {gb_fresh} &nbsp;·&nbsp; cached data</span>
+  </div>
+
+  <!-- Strategy tabs -->
+  <div style="display:flex;gap:0;margin-bottom:0;border-bottom:1px solid var(--border)">
+    <button class="ftab active" id="ftab-smc"     onclick="fxTab('smc')"
+      style="padding:7px 20px;font-family:var(--mono);font-size:12px;font-weight:700;border:none;cursor:pointer;
+             border-radius:5px 5px 0 0;background:#1c2230;color:#4a9eff;border-bottom:2px solid #4a9eff">
+      SMC Method
+    </button>
+    <button class="ftab" id="ftab-sess"   onclick="fxTab('sess')"
+      style="padding:7px 20px;font-family:var(--mono);font-size:12px;font-weight:700;border:none;cursor:pointer;
+             border-radius:5px 5px 0 0;background:transparent;color:var(--muted);border-bottom:2px solid transparent">
+      Session Trading
+    </button>
+  </div>
+
+  <!-- ── SMC pane ───────────────────────────────────────────────────────────── -->
+  <div id="fpane-smc" style="padding-top:12px">
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px;line-height:1.6">
+      <strong style="color:#4a9eff">SMC Sniper — Forex 4H→1H chain:</strong>
+      4H HH+HL or LL+LH bias · 4H OB/FVG POI (displacement ≥1×ATR) · Fib 50% discount/premium filter ·
+      1H liquidity sweep · 1H displacement · 1H CHoCH → signal.
+      SL = swept wick ± 2 pips. Target = 3R or nearest BSL/SSL pool.
+    </div>
+    <!-- Pair sub-tabs -->
+    <div style="display:flex;gap:6px;margin-bottom:10px">
+      <button id="stab-eu-smc" onclick="fxSub('smc','eu')"
+        style="padding:4px 14px;font-family:var(--mono);font-size:11px;font-weight:700;border-radius:4px;
+               border:1px solid #4a9eff;background:#0a1f40;color:#4a9eff;cursor:pointer">EURUSD</button>
+      <button id="stab-gb-smc" onclick="fxSub('smc','gb')"
+        style="padding:4px 14px;font-family:var(--mono);font-size:11px;font-weight:700;border-radius:4px;
+               border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer">GBPUSD</button>
+    </div>
+    <!-- EURUSD SMC -->
+    <div id="spane-eu-smc">
+      <div style="display:grid;grid-template-columns:1fr 200px;gap:12px;align-items:start">
+        <div>{eu_smc_svg}</div>
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#4a9eff;margin-bottom:10px">EURUSD Signal Gates</div>
+          {eu_smc_gates}
+        </div>
+      </div>
+    </div>
+    <!-- GBPUSD SMC -->
+    <div id="spane-gb-smc" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 200px;gap:12px;align-items:start">
+        <div>{gb_smc_svg}</div>
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#4a9eff;margin-bottom:10px">GBPUSD Signal Gates</div>
+          {gb_smc_gates}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Session pane ───────────────────────────────────────────────────────── -->
+  <div id="fpane-sess" style="display:none;padding-top:12px">
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px;line-height:1.6">
+      <strong style="color:#e3b341">Asian Session Box — 00:00–08:00 UTC:</strong>
+      Box = session high/low. Classify by ATR ratio: range (ratio&lt;0.5) · trend (ratio&gt;0.7).
+      Sweep = wick beyond box extreme by 0.2% of range, close back inside.
+      Entry models: sweep (body back inside box) · range (fade box edge) · trend (box midpoint pullback).
+      SL = 25% of box range. First partial = 75% at opposite box edge (sweep/range) or 4R (trend). Final = 5R.
+      4H macro bias gate (must be non-neutral).
+    </div>
+    <!-- Pair sub-tabs -->
+    <div style="display:flex;gap:6px;margin-bottom:10px">
+      <button id="stab-eu-sess" onclick="fxSub('sess','eu')"
+        style="padding:4px 14px;font-family:var(--mono);font-size:11px;font-weight:700;border-radius:4px;
+               border:1px solid #e3b341;background:#2a1e00;color:#e3b341;cursor:pointer">EURUSD</button>
+      <button id="stab-gb-sess" onclick="fxSub('sess','gb')"
+        style="padding:4px 14px;font-family:var(--mono);font-size:11px;font-weight:700;border-radius:4px;
+               border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer">GBPUSD</button>
+    </div>
+    <!-- EURUSD Session -->
+    <div id="spane-eu-sess">
+      <div style="display:grid;grid-template-columns:1fr 200px;gap:12px;align-items:start">
+        <div>{eu_sess_svg}</div>
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#e3b341;margin-bottom:10px">EURUSD Session</div>
+          {eu_sess_panel}
+        </div>
+      </div>
+    </div>
+    <!-- GBPUSD Session -->
+    <div id="spane-gb-sess" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 200px;gap:12px;align-items:start">
+        <div>{gb_sess_svg}</div>
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#e3b341;margin-bottom:10px">GBPUSD Session</div>
+          {gb_sess_panel}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function fxTab(t) {{
+  ['smc','sess'].forEach(s => {{
+    document.getElementById('fpane-' + s).style.display = s === t ? '' : 'none';
+    const btn = document.getElementById('ftab-' + s);
+    if (s === t) {{
+      btn.style.color = '#4a9eff'; btn.style.borderBottom = '2px solid #4a9eff';
+      btn.style.background = '#1c2230';
+    }} else {{
+      btn.style.color = 'var(--muted)'; btn.style.borderBottom = '2px solid transparent';
+      btn.style.background = 'transparent';
+    }}
+  }});
+}}
+function fxSub(strategy, pair) {{
+  ['eu','gb'].forEach(p => {{
+    const pane = document.getElementById('spane-' + p + '-' + strategy);
+    const btn  = document.getElementById('stab-' + p + '-' + strategy);
+    if (!pane || !btn) return;
+    pane.style.display = p === pair ? '' : 'none';
+    const acol = strategy === 'smc' ? '#4a9eff' : '#e3b341';
+    const abg  = strategy === 'smc' ? '#0a1f40' : '#2a1e00';
+    if (p === pair) {{
+      btn.style.borderColor = acol; btn.style.color = acol; btn.style.background = abg;
+    }} else {{
+      btn.style.borderColor = 'var(--border)'; btn.style.color = 'var(--muted)';
+      btn.style.background = 'transparent';
+    }}
+  }});
+}}
+</script>"""
+
+
 # ── HTML builder ───────────────────────────────────────────────────────────────
 
 def _fmt_price(v) -> str:
@@ -1881,6 +2717,7 @@ def _build_html(
   <div class="grid-2" style="margin-bottom:12px">{st_html}{links_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{trades_html}</div>
   <div class="grid-2" style="margin-bottom:12px">{checklist_html}</div>
+  {_forex_charts_html()}
   <div class="grid-2">{log_html}</div>
   <script>const lb=document.getElementById('lb');if(lb)lb.scrollTop=lb.scrollHeight;</script>
 </body>

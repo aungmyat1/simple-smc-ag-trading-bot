@@ -1,7 +1,7 @@
 exchange:
   symbol: BTCUSDT
-  htf: 4h       # 4H bias + POI (Trial 21 PASS — 4H+1H chain)
-  ltf: 1h       # 1H sweep + displacement + CHoCH execution
+  htf: 1h       # 1H bias + POI (Trial 25: 1H+5M+FVG-retest chain)
+  ltf: 5m       # 5M sweep + displacement + CHoCH + FVG retest
   # API keys come from .env (BYBIT_API_KEY / BYBIT_API_SECRET)
   # LIVE_TRADING must be False; only the owner flips it manually
 
@@ -43,7 +43,9 @@ liquidity:
   swing_n: 3        # bars each side for 1H swing detection
   lookback: 30      # how many 1H bars to scan for prior swing levels
   displacement_atr: 1.0   # Trial 21 baseline: 1.0×ATR post-sweep displacement gate
-  ltf_poi_lookback: 15    # bars after sweep to scan for 1H entry OB/FVG
+  ltf_poi_lookback: 15    # bars after sweep to scan for 5M entry OB/FVG
+  fvg_retest_enabled: true   # require 5M FVG retest after CHoCH before entry
+  fvg_retest_lookforward: 20 # max 5M bars after CHoCH to wait for FVG retest
 
 confirmation:
   lookback: 10      # 1H bars before sweep to establish the CHoCH reference level
@@ -59,8 +61,8 @@ partials:
   tp2_at_liquidity: true   # close remaining at BSL/SSL; fallback_r used if no pool found
 
 data:
-  htf_limit: 200    # 4H candles to fetch (~33 days for POI detection)
-  ltf_limit: 150    # 1H candles to fetch (~6 days for sweep/CHoCH)
+  htf_limit: 200    # 1H candles to fetch (~8 days for bias + POI detection)
+  ltf_limit: 300    # 5M candles to fetch (~1 day for sweep/CHoCH/FVG retest)
 
 signal_only_mode: false  # Phase-1a: paper mode (LIVE_TRADING not set → executor logs intent only)
 

@@ -95,6 +95,17 @@ H1_BIAS_FILTER: bool = False
 # 0.0 = disabled; 0.01 = require ≥1% from midpoint. Set by --fib-dist-min at runtime.
 FIB_DIST_MIN: float = 0.0
 
+# Trial 25: require 5M FVG retest after CHoCH (1H+5M chain).
+# When True, after CHoCH the backtest scans forward for the first bar where
+# price wicks into a 5M FVG left by the displacement. Entry = open of next bar.
+FVG_RETEST:    bool = False
+FVG_RETEST_LF: int  = _CFG["liquidity"].get("fvg_retest_lookforward", 20)
+BOS_RETEST_LF: int  = 20   # Trial 29: max bars to wait for BOS OB retest
+
+# Audit rows populated during run_backtest() when FVG_RETEST is True.
+# Cleared at the start of each run; exported via stats["fvg_audit"].
+_FVG_AUDIT: list[dict] = []
+
 TAKER_FEE  = 0.0006   # Bybit taker 0.06%/side (not in config.yaml — exchange constant)
 ROUND_TRIP = TAKER_FEE * 2
 
@@ -115,6 +126,16 @@ SPREAD_PIPS: float       = 0.8       # forex: typical EURUSD raw spread (one cro
 COMMISSION_RT_PIPS: float = 0.6      # forex: VT Markets Raw ≈ $3/side/lot ≈ 0.6 pip round-trip
 PIP_SIZE: float          = 0.0001    # forex: 0.0001 majors, 0.01 for JPY pairs
 
+
+# Per-instrument cost presets (VT Markets Raw ECN defaults).
+# Selected by --symbol-preset; individual --spread-pips / --commission-rt-pips /
+# --pip-size args take precedence when given alongside --symbol-preset.
+_SYMBOL_PRESETS: dict[str, dict] = {
+    "EURUSD": {"spread_pips": 0.8,  "commission_rt_pips": 0.6, "pip_size": 0.0001},
+    "GBPUSD": {"spread_pips": 1.0,  "commission_rt_pips": 0.6, "pip_size": 0.0001},
+    "USDJPY": {"spread_pips": 0.8,  "commission_rt_pips": 0.6, "pip_size": 0.01},
+    "XAUUSD": {"spread_pips": 25.0, "commission_rt_pips": 6.0, "pip_size": 0.01},
+}
 
 def _cost_r(entry_price: float, stop_dist: float) -> float:
     """Round-trip transaction cost expressed in R (cost_price / stop_dist).
@@ -558,6 +579,152 @@ def _fast_bos(choch_bar: int, bias: str, lookforward: int = 20) -> int | None:
     return None
 
 
+def _fast_bos_continuation(i: int, bias: str) -> "dict | None":
+    """
+    Trial 29 — BOS-retest continuation entry detector (causal).
+
+    Detects the first bar where the LTF close breaks a confirmed prior swing extreme
+    in the HTF-bias direction, then identifies the pullback OB left by that impulse.
+
+    Bullish:
+      • Most recent confirmed LTF swing high sh (sh_bar ≤ i − LIQ_SN).
+      • BOS = close[i] > high[sh_bar].
+      • OB = last bearish candle in [sh_bar, i−1] (the pullback block).
+
+    Bearish:
+      • Most recent confirmed LTF swing low sl (sl_bar ≤ i − LIQ_SN).
+      • BOS = close[i] < low[sl_bar].
+      • OB = last bullish candle in [sl_bar, i−1].
+
+    Returns dict with bos_bar, sh/sl level, ob_bar, ob_lo, ob_hi — or None.
+    All information is causal (uses only bars ≤ i).
+    """
+    max_conf = i - LIQ_SN
+    if bias == "bullish":
+        right = bisect.bisect_right(_SH_5M, max_conf)
+        if right == 0:
+            return None
+        sh_bar   = int(_SH_5M[right - 1])
+        sh_level = float(_H_5M[sh_bar])
+        if _C_5M[i] <= sh_level:
+            return None
+        # OB = last bearish candle in [sh_bar+1, i-1]
+        ob_bar = None
+        for j in range(i - 1, sh_bar, -1):
+            if _C_5M[j] < _O_5M[j]:
+                ob_bar = j
+                break
+        if ob_bar is None:
+            return None
+        ob_lo = float(min(_O_5M[ob_bar], _C_5M[ob_bar]))
+        ob_hi = float(max(_O_5M[ob_bar], _C_5M[ob_bar]))
+        return {"bos_bar": i, "ref_bar": sh_bar, "ref_level": sh_level,
+                "ob_bar": ob_bar, "ob_lo": ob_lo, "ob_hi": ob_hi}
+
+    else:  # bearish
+        right = bisect.bisect_right(_SL_5M, max_conf)
+        if right == 0:
+            return None
+        sl_bar   = int(_SL_5M[right - 1])
+        sl_level = float(_L_5M[sl_bar])
+        if _C_5M[i] >= sl_level:
+            return None
+        # OB = last bullish candle in [sl_bar+1, i-1]
+        ob_bar = None
+        for j in range(i - 1, sl_bar, -1):
+            if _C_5M[j] > _O_5M[j]:
+                ob_bar = j
+                break
+        if ob_bar is None:
+            return None
+        ob_lo = float(min(_O_5M[ob_bar], _C_5M[ob_bar]))
+        ob_hi = float(max(_O_5M[ob_bar], _C_5M[ob_bar]))
+        return {"bos_bar": i, "ref_bar": sl_bar, "ref_level": sl_level,
+                "ob_bar": ob_bar, "ob_lo": ob_lo, "ob_hi": ob_hi}
+
+
+def _fast_bos_retest(bos_bar: int, ob_lo: float, ob_hi: float, bias: str) -> "int | None":
+    """
+    Trial 29 — first bar after BOS where price closes BACK INTO the OB zone.
+
+    Bullish: wick enters OB (low ≤ ob_hi) AND close ≥ ob_lo  (didn't close below OB)
+    Bearish: wick enters OB (high ≥ ob_lo) AND close ≤ ob_hi
+
+    Returns bar index of the retest candle, or None if not found within BOS_RETEST_LF.
+    Entry = open of retest_bar + 1.
+    """
+    limit = min(bos_bar + BOS_RETEST_LF + 1, len(_C_5M) - 1)
+    for k in range(bos_bar + 1, limit):
+        if bias == "bullish":
+            if _L_5M[k] <= ob_hi and _C_5M[k] >= ob_lo:
+                return k
+        else:
+            if _H_5M[k] >= ob_lo and _C_5M[k] <= ob_hi:
+                return k
+    return None
+
+
+
+def _find_post_choch_displacement(choch_bar: int, bias: str, max_look: int = 5) -> int | None:
+    """
+    First strong directional candle in (choch_bar, choch_bar+max_look].
+
+    "Strong" = range >= DISP_ATR_LTF x ATR14 at choch_bar AND body in bias direction.
+    Returns bar index of that displacement candle, or None.
+    """
+    if choch_bar + 1 >= len(_C_5M):
+        return None
+    atr   = float(_ATR14_5M[choch_bar])
+    limit = min(choch_bar + max_look + 1, len(_C_5M) - 1)
+    for k in range(choch_bar + 1, limit):
+        if (_H_5M[k] - _L_5M[k]) < DISP_ATR_LTF * atr:
+            continue
+        if bias == "bearish" and _C_5M[k] < _O_5M[k]:
+            return k
+        if bias == "bullish" and _C_5M[k] > _O_5M[k]:
+            return k
+    return None
+
+
+def _fvg_from_displacement(disp_bar: int, bias: str) -> "tuple | None":
+    """
+    3-bar FVG created by the displacement candle at disp_bar.
+
+    Pattern: bars [disp_bar-1, disp_bar, disp_bar+1].
+    Bearish: fvg_hi = low[disp_bar-1],  fvg_lo = high[disp_bar+1]  (gap down)
+    Bullish: fvg_lo = high[disp_bar-1], fvg_hi = low[disp_bar+1]   (gap up)
+
+    Returns (fvg_lo, fvg_hi, fvg_bar) where fvg_bar = disp_bar+1, or None.
+    """
+    fvg_bar = disp_bar + 1
+    if disp_bar < 1 or fvg_bar >= len(_C_5M):
+        return None
+    if bias == "bearish":
+        fvg_hi = float(_L_5M[disp_bar - 1])
+        fvg_lo = float(_H_5M[fvg_bar])
+        if fvg_hi > fvg_lo:
+            return (fvg_lo, fvg_hi, fvg_bar)
+    else:
+        fvg_lo = float(_H_5M[disp_bar - 1])
+        fvg_hi = float(_L_5M[fvg_bar])
+        if fvg_hi > fvg_lo:
+            return (fvg_lo, fvg_hi, fvg_bar)
+    return None
+
+
+def _fast_fvg_retest_specific(fvg_bar: int, fvg_lo: float, fvg_hi: float) -> "int | None":
+    """
+    First bar after fvg_bar where any wick enters [fvg_lo, fvg_hi].
+    Returns bar index of the retest candle, or None if not found within FVG_RETEST_LF.
+    Entry = open of retest_bar+1.
+    """
+    limit = min(fvg_bar + FVG_RETEST_LF + 1, len(_C_5M) - 1)
+    for k in range(fvg_bar + 1, limit):
+        if _L_5M[k] <= fvg_hi and _H_5M[k] >= fvg_lo:
+            return k
+    return None
+
+
 def _in_kill_zone(ltf_idx: int) -> bool:
     """Sprint 3 — True if 5M bar falls in London (08-15 UTC) or NY (13-21 UTC)."""
     if _HOUR_5M is None:
@@ -981,6 +1148,9 @@ def run_backtest_asian(
 # ── Backtest ──────────────────────────────────────────────────────────────────
 
 def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -> dict:
+    global _FVG_AUDIT
+    _FVG_AUDIT = []   # reset before each run
+
     htf_map    = _align_htf(df_1h, df_5m)
     open_5m    = _O_5M
     high_5m    = _H_5M
@@ -1059,6 +1229,52 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
                 if bos_bar is None:
                     continue
                 entry_bar = bos_bar + 1
+            elif FVG_RETEST:
+                # Trial 25 (owned FVG): post-CHoCH displacement creates the FVG
+                choch_ts_b = str(df_5m["ts"].iloc[i]) if "ts" in df_5m.columns else str(i)
+                disp_bar_b = _find_post_choch_displacement(i, bias)
+                if disp_bar_b is None:
+                    _FVG_AUDIT.append({
+                        "side": "long", "choch_ts": choch_ts_b, "choch_bar": i,
+                        "disp_bar": None, "disp_ts": None,
+                        "fvg_lo": None, "fvg_hi": None, "fvg_bar": None, "fvg_ts": None,
+                        "retest_bar": None, "retest_ts": None,
+                        "verdict": "FAIL", "fail_reason": "no_post_choch_displacement",
+                    })
+                    continue
+                disp_ts_b  = str(df_5m["ts"].iloc[disp_bar_b]) if "ts" in df_5m.columns else str(disp_bar_b)
+                fvg_t_b    = _fvg_from_displacement(disp_bar_b, bias)
+                if fvg_t_b is None:
+                    _FVG_AUDIT.append({
+                        "side": "long", "choch_ts": choch_ts_b, "choch_bar": i,
+                        "disp_bar": disp_bar_b, "disp_ts": disp_ts_b,
+                        "fvg_lo": None, "fvg_hi": None, "fvg_bar": None, "fvg_ts": None,
+                        "retest_bar": None, "retest_ts": None,
+                        "verdict": "FAIL", "fail_reason": "no_fvg_from_displacement",
+                    })
+                    continue
+                fvg_lo_b, fvg_hi_b, fvg_bar_b = fvg_t_b
+                fvg_ts_b   = str(df_5m["ts"].iloc[fvg_bar_b]) if "ts" in df_5m.columns else str(fvg_bar_b)
+                retest_b   = _fast_fvg_retest_specific(fvg_bar_b, fvg_lo_b, fvg_hi_b)
+                if retest_b is None:
+                    _FVG_AUDIT.append({
+                        "side": "long", "choch_ts": choch_ts_b, "choch_bar": i,
+                        "disp_bar": disp_bar_b, "disp_ts": disp_ts_b,
+                        "fvg_lo": fvg_lo_b, "fvg_hi": fvg_hi_b, "fvg_bar": fvg_bar_b, "fvg_ts": fvg_ts_b,
+                        "retest_bar": None, "retest_ts": None,
+                        "verdict": "FAIL", "fail_reason": "no_retest_within_lookforward",
+                    })
+                    continue
+                retest_ts_b = str(df_5m["ts"].iloc[retest_b]) if "ts" in df_5m.columns else str(retest_b)
+                _FVG_AUDIT.append({
+                    "side": "long", "choch_ts": choch_ts_b, "choch_bar": i,
+                    "disp_bar": disp_bar_b, "disp_ts": disp_ts_b,
+                    "fvg_lo": round(fvg_lo_b, 5), "fvg_hi": round(fvg_hi_b, 5),
+                    "fvg_bar": fvg_bar_b, "fvg_ts": fvg_ts_b,
+                    "retest_bar": retest_b, "retest_ts": retest_ts_b,
+                    "verdict": "PASS", "fail_reason": None,
+                })
+                entry_bar = retest_b + 1
             else:
                 entry_bar = i + 1
 
@@ -1117,6 +1333,52 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
                 if bos_bar is None:
                     continue
                 entry_bar = bos_bar + 1
+            elif FVG_RETEST:
+                # Trial 25 (owned FVG): post-CHoCH displacement creates the FVG
+                choch_ts_s = str(df_5m["ts"].iloc[i]) if "ts" in df_5m.columns else str(i)
+                disp_bar_s = _find_post_choch_displacement(i, bias)
+                if disp_bar_s is None:
+                    _FVG_AUDIT.append({
+                        "side": "short", "choch_ts": choch_ts_s, "choch_bar": i,
+                        "disp_bar": None, "disp_ts": None,
+                        "fvg_lo": None, "fvg_hi": None, "fvg_bar": None, "fvg_ts": None,
+                        "retest_bar": None, "retest_ts": None,
+                        "verdict": "FAIL", "fail_reason": "no_post_choch_displacement",
+                    })
+                    continue
+                disp_ts_s  = str(df_5m["ts"].iloc[disp_bar_s]) if "ts" in df_5m.columns else str(disp_bar_s)
+                fvg_t_s    = _fvg_from_displacement(disp_bar_s, bias)
+                if fvg_t_s is None:
+                    _FVG_AUDIT.append({
+                        "side": "short", "choch_ts": choch_ts_s, "choch_bar": i,
+                        "disp_bar": disp_bar_s, "disp_ts": disp_ts_s,
+                        "fvg_lo": None, "fvg_hi": None, "fvg_bar": None, "fvg_ts": None,
+                        "retest_bar": None, "retest_ts": None,
+                        "verdict": "FAIL", "fail_reason": "no_fvg_from_displacement",
+                    })
+                    continue
+                fvg_lo_s, fvg_hi_s, fvg_bar_s = fvg_t_s
+                fvg_ts_s   = str(df_5m["ts"].iloc[fvg_bar_s]) if "ts" in df_5m.columns else str(fvg_bar_s)
+                retest_s   = _fast_fvg_retest_specific(fvg_bar_s, fvg_lo_s, fvg_hi_s)
+                if retest_s is None:
+                    _FVG_AUDIT.append({
+                        "side": "short", "choch_ts": choch_ts_s, "choch_bar": i,
+                        "disp_bar": disp_bar_s, "disp_ts": disp_ts_s,
+                        "fvg_lo": fvg_lo_s, "fvg_hi": fvg_hi_s, "fvg_bar": fvg_bar_s, "fvg_ts": fvg_ts_s,
+                        "retest_bar": None, "retest_ts": None,
+                        "verdict": "FAIL", "fail_reason": "no_retest_within_lookforward",
+                    })
+                    continue
+                retest_ts_s = str(df_5m["ts"].iloc[retest_s]) if "ts" in df_5m.columns else str(retest_s)
+                _FVG_AUDIT.append({
+                    "side": "short", "choch_ts": choch_ts_s, "choch_bar": i,
+                    "disp_bar": disp_bar_s, "disp_ts": disp_ts_s,
+                    "fvg_lo": round(fvg_lo_s, 5), "fvg_hi": round(fvg_hi_s, 5),
+                    "fvg_bar": fvg_bar_s, "fvg_ts": fvg_ts_s,
+                    "retest_bar": retest_s, "retest_ts": retest_ts_s,
+                    "verdict": "PASS", "fail_reason": None,
+                })
+                entry_bar = retest_s + 1
             else:
                 entry_bar = i + 1
 
@@ -1207,6 +1469,143 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
         "max_dd_r":     round(max_dd, 4),
         "no_pool_skip": no_pool_skip,
         "trades":       trades,
+        "fvg_audit":    _FVG_AUDIT[:],   # ownership audit rows (non-empty only when --fvg-retest)
+    }
+
+
+
+def run_backtest_continuation(
+    df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both"
+) -> dict:
+    """
+    Trial 29 — BOS-retest continuation backtest.
+
+    HTF (df_1h arrays → _H_1H/_SH_1H etc.) sets trend bias.
+    LTF (df_5m arrays → _H_5M/_SH_5M etc.) provides BOS detection and exit scanning.
+    Fixed TGT_FALLBACK TP, SL at OB boundary ± SL_BUF.
+    """
+    htf_map  = _align_htf(df_1h, df_5m)
+    open_5m  = _O_5M
+    high_5m  = _H_5M
+    low_5m   = _L_5M
+
+    _htf_cache: dict[int, str] = {}
+    trades: list[dict] = []
+    skip_until = 0
+
+    for i in range(LTF_WARMUP, len(df_5m) - 1):
+        if i < skip_until:
+            continue
+
+        htf_idx = int(htf_map[i])
+        if htf_idx < 0:
+            continue
+
+        if htf_idx not in _htf_cache:
+            _htf_cache[htf_idx] = _fast_bias(htf_idx)
+        bias = _htf_cache[htf_idx]
+
+        if bias == "neutral":
+            continue
+        if side == "long"  and bias != "bullish":
+            continue
+        if side == "short" and bias != "bearish":
+            continue
+
+        bos = _fast_bos_continuation(i, bias)
+        if bos is None:
+            continue
+
+        retest_bar = _fast_bos_retest(
+            bos["bos_bar"], bos["ob_lo"], bos["ob_hi"], bias
+        )
+        if retest_bar is None:
+            # BOS fired but price never pulled back — skip lookforward, search fresh
+            skip_until = i + BOS_RETEST_LF + 1
+            continue
+
+        entry_bar = retest_bar + 1
+        if entry_bar >= len(df_5m):
+            continue
+
+        entry_price = float(open_5m[entry_bar])
+
+        if bias == "bullish":
+            sl        = bos["ob_lo"] * (1.0 - SL_BUF)
+            stop_dist = entry_price - sl
+            if stop_dist <= 0:
+                skip_until = entry_bar + 1
+                continue
+            tp_full = entry_price + TGT_FALLBACK * stop_dist
+            exit_price, exit_reason, exit_bar = _scan_exit(
+                high_5m, low_5m, entry_bar, sl, tp_full
+            )
+            gross_r    = (exit_price - entry_price) / stop_dist
+            trade_side = "long"
+        else:
+            sl        = bos["ob_hi"] * (1.0 + SL_BUF)
+            stop_dist = sl - entry_price
+            if stop_dist <= 0:
+                skip_until = entry_bar + 1
+                continue
+            tp_full = entry_price - TGT_FALLBACK * stop_dist
+            exit_price, exit_reason, exit_bar = _scan_exit_short(
+                high_5m, low_5m, entry_bar, sl, tp_full
+            )
+            gross_r    = (entry_price - exit_price) / stop_dist
+            trade_side = "short"
+
+        fee_r = _cost_r(entry_price, stop_dist)
+        net_r = gross_r - fee_r
+
+        trades.append({
+            "entry_bar": entry_bar,
+            "exit_bar":  exit_bar,
+            "side":      trade_side,
+            "ts":        str(df_5m["ts"].iloc[i]) if "ts" in df_5m.columns else i,
+            "bos_bar":   bos["bos_bar"],
+            "ob_lo":     _round_px(bos["ob_lo"]),
+            "ob_hi":     _round_px(bos["ob_hi"]),
+            "entry":     _round_px(entry_price),
+            "sl":        _round_px(sl),
+            "tp":        _round_px(tp_full),
+            "gross_r":   round(gross_r, 4),
+            "fee_r":     round(fee_r, 4),
+            "net_r":     round(net_r, 4),
+            "reason":    exit_reason,
+        })
+        skip_until = exit_bar + 1
+
+    if not trades:
+        return {
+            "n": 0, "gross_pf": 0.0, "net_pf": 0.0,
+            "win_rate": 0.0, "avg_fee_r": 0.0, "max_dd_r": 0.0,
+            "expectancy": 0.0, "trades": [],
+        }
+
+    gross_wins = sum(t["gross_r"] for t in trades if t["gross_r"] > 0)
+    gross_loss = abs(sum(t["gross_r"] for t in trades if t["gross_r"] <= 0))
+    net_wins   = sum(t["net_r"]   for t in trades if t["net_r"]   > 0)
+    net_loss   = abs(sum(t["net_r"]   for t in trades if t["net_r"]   <= 0))
+    wins       = sum(1 for t in trades if t["net_r"] > 0)
+
+    equity, peak, max_dd = 0.0, 0.0, 0.0
+    for t in trades:
+        equity += t["net_r"]
+        if equity > peak:
+            peak = equity
+        max_dd = max(max_dd, peak - equity)
+
+    n = len(trades)
+    return {
+        "n":          n,
+        "gross_pf":   round(gross_wins / gross_loss, 4) if gross_loss else float("inf"),
+        "net_pf":     round(net_wins   / net_loss,   4) if net_loss   else float("inf"),
+        "win_rate":   round(wins / n * 100, 2),
+        "avg_fee_r":  round(sum(t["fee_r"] for t in trades) / n, 4),
+        "expectancy": round(sum(t["net_r"] for t in trades) / n, 4),
+        "max_dd_r":   round(max_dd, 4),
+        "trades":     trades,
     }
 
 
@@ -1272,6 +1671,21 @@ def print_report(
     print(f"\n  VERDICT: {verdict}")
     print("=" * 60)
 
+    # ── FVG ownership audit summary (only when --fvg-retest) ────────────────
+    fvg_audit = stats.get("fvg_audit", [])
+    if fvg_audit:
+        n_audit  = len(fvg_audit)
+        n_pass   = sum(1 for r in fvg_audit if r["verdict"] == "PASS")
+        fail_counts: dict[str, int] = {}
+        for r in fvg_audit:
+            if r["verdict"] == "FAIL":
+                fail_counts[r["fail_reason"]] = fail_counts.get(r["fail_reason"], 0) + 1
+        print(f"\n  FVG ownership audit  ({n_audit} CHoCH events evaluated)")
+        print(f"    PASS  (owned FVG retest found): {n_pass}")
+        for reason, cnt in sorted(fail_counts.items(), key=lambda x: -x[1]):
+            print(f"    FAIL  {reason}: {cnt}")
+        print()
+
     # ── Per-year breakdown ────────────────────────────────────────────────────
     trades = stats.get("trades", [])
     if trades:
@@ -1308,6 +1722,90 @@ def print_report(
 
 
 # ── Asian session report + verdict log ───────────────────────────────────────
+
+def _stress_stats(trades: list[dict], mult: float = 2.0) -> dict:
+    """Recompute aggregate stats with transaction cost multiplied by `mult`."""
+    stressed = [t["gross_r"] - t["fee_r"] * mult for t in trades]
+    net_wins  = sum(r for r in stressed if r > 0)
+    net_loss  = abs(sum(r for r in stressed if r <= 0))
+    wins      = sum(1 for r in stressed if r > 0)
+    n         = len(stressed)
+    net_pf    = round(net_wins / net_loss, 4) if net_loss else float("inf")
+    expectancy = round(sum(stressed) / n, 4) if n else 0.0
+    return {"n": n, "net_pf": net_pf, "win_rate": round(wins / n * 100, 2),
+            "expectancy": expectancy}
+
+
+def print_report_continuation(
+    stats: dict,
+    run_label: str = "Trial 29",
+    htf_label: str = "4H",
+    ltf_label: str = "1H",
+    side: str = "both",
+) -> None:
+    """
+    Print Phase-0 gate report for Trial 29 BOS-retest continuation signal.
+    Shows both standard cost and 2× cost stress.
+    Gate: n≥50 AND net PF>1.0 at BOTH levels.
+    """
+    trades = stats.get("trades", [])
+    n, gross_pf, net_pf = stats["n"], stats["gross_pf"], stats["net_pf"]
+    print("\n" + "=" * 64)
+    print(f"  Trial 29 — BOS-Retest Continuation  ({run_label})")
+    print("=" * 64)
+    print(f"  Signal  : {htf_label} bias → {ltf_label} BOS+OB-retest (no sweep/CHoCH)")
+    print(f"  Symbol  : {SYMBOL}  HTF={htf_label}  LTF={ltf_label}  side={side}")
+    print(f"  Exit    : {TGT_FALLBACK}R fixed TP  |  SL = OB-boundary ± {SL_BUF*100:.1f}%")
+    print(f"  Cost    : {_cost_label()}")
+    print("-" * 64)
+
+    if n == 0:
+        print("  NO TRADES FOUND — signal too restrictive or data too short.")
+        _gate_verdict(False, False)
+        return
+
+    print(f"  Trades  : {n}")
+    print(f"  Win%    : {stats['win_rate']:.1f}%")
+    print(f"  Gross PF: {gross_pf:.4f}")
+    print(f"  Net PF  : {net_pf:.4f}   (standard cost)")
+    print(f"  Expect  : {stats['expectancy']:+.4f}R/trade")
+    print(f"  Max DD  : {stats['max_dd_r']:.4f}R  |  Avg fee: {stats['avg_fee_r']:.4f}R")
+    print()
+
+    # ── 2× cost stress ───────────────────────────────────────────────────────
+    s2 = _stress_stats(trades, mult=2.0)
+    print(f"  ── 2× cost stress ──────────────────────────────────────────")
+    print(f"  Net PF  : {s2['net_pf']:.4f}   Win%: {s2['win_rate']:.1f}%  Expect: {s2['expectancy']:+.4f}R")
+    print()
+
+    pass_std    = n >= 50 and net_pf    > 1.0
+    pass_stress = n >= 50 and s2["net_pf"] > 1.0
+
+    print(f"  ── Phase-0 Gate ─────────────────────────────────────────────")
+    print(f"  Standard cost : {'PASS ✓' if pass_std    else 'FAIL ✗'}  "
+          f"(n={n}≥50: {'✓' if n>=50 else '✗'}  net PF {net_pf:.4f}>1.0: {'✓' if net_pf>1.0 else '✗'})")
+    print(f"  2× cost stress: {'PASS ✓' if pass_stress else 'FAIL ✗'}  "
+          f"(net PF {s2['net_pf']:.4f}>1.0: {'✓' if s2['net_pf']>1.0 else '✗'})")
+
+    if pass_std and pass_stress:
+        print()
+        print("  *** GATE: PASS — advance to Phase-1 paper trade ***")
+    elif n < 50:
+        print()
+        print(f"  *** GATE: INCONCLUSIVE — n={n} < 50 (signal starvation, not edge kill) ***")
+        print("  → HALT-AND-ESCALATE: Forex SMC continuation has insufficient signal count.")
+    else:
+        print()
+        print("  *** GATE: FAIL — edge insufficient at this cost level ***")
+    print("=" * 64)
+
+
+def _gate_verdict(pass_std: bool, pass_stress: bool) -> None:
+    if pass_std and pass_stress:
+        print("  *** GATE: PASS ***")
+    else:
+        print("  *** GATE: FAIL ***")
+
 
 def print_report_asian(
     stats: dict,
@@ -1727,11 +2225,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--signal", default="smc", choices=["smc", "asian_session"],
+        "--fvg-retest", action="store_true",
+        help=(
+            "Trial 25 (1H+5M chain): after CHoCH, require price to wick into a 5M FVG "
+            "formed by the displacement before entry. Entry = open of bar after retest. "
+            "Run with --htf 1H parquet --ltf 5M parquet."
+        ),
+    )
+    parser.add_argument(
+        "--signal", default="smc", choices=["smc", "asian_session", "continuation"],
         help=(
             "Signal type: 'smc' = existing 15-step SMC chain (default); "
-            "'asian_session' = Asian box (00-08 UTC) sweep/range/trend signal. "
-            "When using asian_session, --htf must be the 4H parquet and --ltf the 1H parquet."
+            "'asian_session' = Asian box (00-08 UTC) sweep/range/trend signal; "
+            "'continuation' = Trial 29 BOS-retest (HTF bias + LTF BOS + OB retest, no sweep/CHoCH). "
+            "For continuation: --htf=4H --ltf=1H."
         ),
     )
     parser.add_argument(
@@ -1768,6 +2275,15 @@ def main() -> None:
         "--pip-size", type=float, default=0.0001,
         help="forex cost: pip size (default 0.0001 majors; use 0.01 for JPY pairs).",
     )
+    parser.add_argument(
+        "--symbol-preset", default=None,
+        choices=list(_SYMBOL_PRESETS),
+        help=(
+            "Apply instrument-specific VT Markets Raw ECN cost defaults "
+            "(EURUSD/GBPUSD/USDJPY/XAUUSD). "
+            "Individual --spread-pips / --commission-rt-pips / --pip-size override the preset."
+        ),
+    )
     args = parser.parse_args()
 
     # Apply forex cost-model settings (no-op for default --cost-model pct)
@@ -1775,6 +2291,16 @@ def main() -> None:
     SPREAD_PIPS        = args.spread_pips
     COMMISSION_RT_PIPS = args.commission_rt_pips
     PIP_SIZE           = args.pip_size
+
+    # --symbol-preset: apply instrument defaults, then let explicit args override
+    if args.symbol_preset:
+        _p = _SYMBOL_PRESETS[args.symbol_preset]
+        if args.spread_pips        == parser.get_default("spread_pips"):
+            SPREAD_PIPS        = _p["spread_pips"]
+        if args.commission_rt_pips == parser.get_default("commission_rt_pips"):
+            COMMISSION_RT_PIPS = _p["commission_rt_pips"]
+        if args.pip_size           == parser.get_default("pip_size"):
+            PIP_SIZE           = _p["pip_size"]
 
     for label, path in [("HTF (1H)", args.htf), ("LTF (5M)", args.ltf)]:
         if not Path(path).exists():
@@ -1815,6 +2341,7 @@ def main() -> None:
     FVG_ENTRIES    = args.fvg_entries
     H1_BIAS_FILTER = args.h1_bias_filter
     FIB_DIST_MIN   = args.fib_dist_min
+    FVG_RETEST     = args.fvg_retest
 
     def _tf_label(path: str) -> str:
         stem = Path(path).stem.rsplit("_", 1)
@@ -1839,6 +2366,18 @@ def main() -> None:
         if args.csv:
             save_trades_csv(stats, args.csv)
         _append_verdict_log(stats, run_label, args.trial, setup_filter=setup_filter)
+        return
+
+    if args.signal == "continuation":
+        print(f"Running Trial 29 BOS-retest continuation backtest …", flush=True)
+        stats = run_backtest_continuation(df_1h, df_5m, side=args.side)
+        print_report_continuation(
+            stats, run_label=run_label,
+            htf_label=htf_label, ltf_label=ltf_label, side=args.side,
+        )
+        sys.stdout.flush()
+        if args.csv:
+            save_trades_csv(stats, args.csv)
         return
 
     if args.sensitivity:
@@ -1904,6 +2443,26 @@ def main() -> None:
     stats = run_backtest(df_1h, df_5m, side=args.side)
     print_report(stats, run_label=run_label, htf_label=htf_label, ltf_label=ltf_label, side=args.side)
     sys.stdout.flush()
+
+    # FVG ownership audit CSV (only when --fvg-retest; auto-path to reports/)
+    if FVG_RETEST and stats.get("fvg_audit"):
+        import datetime as _dt2
+        reports_dir = ROOT / "reports"
+        reports_dir.mkdir(exist_ok=True)
+        audit_path = reports_dir / f"fvg_audit_{_dt2.date.today().isoformat()}.csv"
+        audit_rows = stats["fvg_audit"]
+        audit_keys = [
+            "side", "choch_ts", "choch_bar",
+            "disp_bar", "disp_ts",
+            "fvg_lo", "fvg_hi", "fvg_bar", "fvg_ts",
+            "retest_bar", "retest_ts",
+            "verdict", "fail_reason",
+        ]
+        with open(audit_path, "w", newline="") as _af:
+            _aw = csv.DictWriter(_af, fieldnames=audit_keys, extrasaction="ignore")
+            _aw.writeheader()
+            _aw.writerows(audit_rows)
+        print(f"  FVG ownership audit → {audit_path}  ({len(audit_rows)} rows)")
 
     print("Running Phase-D funnel …", flush=True)
     funnel = count_funnel(df_1h, df_5m)
