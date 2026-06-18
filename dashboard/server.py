@@ -752,7 +752,7 @@ def _render_chart_svg(df_5m, pipe: dict, position: dict) -> str:
     o.append(f'<text x="{ML+CW-72}" y="{MT+18}" text-anchor="middle" fill="{scol}" font-family="monospace" font-size="9" font-weight="bold">{stage_lbl}</text>')
 
     # ── axis label ────────────────────────────────────────────────────────────
-    o.append(f'<text x="{W//2}" y="{H-6}" text-anchor="middle" fill="#3d4a5a" font-family="monospace" font-size="9">BTCUSDT · 5M · last {n} bars</text>')
+    o.append(f'<text x="{W//2}" y="{H-6}" text-anchor="middle" fill="#3d4a5a" font-family="monospace" font-size="9">{SYMBOL} · {LTF.upper()} · last {n} bars</text>')
     o.append(f'<text x="{ML+4}" y="{H-6}" fill="#3d4a5a" font-family="monospace" font-size="9">price →</text>')
     o.append(f'<text x="{ML+CW-4}" y="{H-6}" text-anchor="end" fill="#3d4a5a" font-family="monospace" font-size="9">time →</text>')
 
@@ -886,11 +886,11 @@ def _proximity_html(pipe: dict, position: dict) -> str:
 
     # Stage progress bar — 5 steps interleaved with 4 connectors
     steps = [
-        ("1H Bias",   stage >= 1),
-        ("Fib+POI",   stage >= 2),
-        ("5M Sweep",  stage >= 3),
-        ("Displace",  stage >= 4),
-        ("5M CHoCH",  stage >= 5),
+        (f"{HTF.upper()} Bias",  stage >= 1),
+        ("Fib+POI",              stage >= 2),
+        (f"{LTF.upper()} Sweep", stage >= 3),
+        ("Displace",             stage >= 4),
+        (f"{LTF.upper()} CHoCH", stage >= 5),
     ]
 
     bar_parts: list[str] = []
@@ -1757,12 +1757,12 @@ def _build_html(
         pipe_html = f"""
         <div class="card">
           <div class="card-title">Signal Gates · BTC {_fmt_price(pipe['price'])}</div>
-          {_gate_row(bias_icon, "1H Bias", bias.upper(), bias_cls)}
+          {_gate_row(bias_icon, f"{HTF.upper()} Bias", bias.upper(), bias_cls)}
           {_gate_row("✅" if fib_ok else "⬜", "Fib Zone", fib_lbl, fib_cls)}
-          {_gate_row("✅" if pipe['in_poi'] else "⬜", "1H POI", poi_lbl, poi_cls)}
-          {_gate_row("✅" if pipe['sweep'] else "⬜", "5M Sweep", sw_lbl, sw_cls)}
+          {_gate_row("✅" if pipe['in_poi'] else "⬜", f"{HTF.upper()} POI", poi_lbl, poi_cls)}
+          {_gate_row("✅" if pipe['sweep'] else "⬜", f"{LTF.upper()} Sweep", sw_lbl, sw_cls)}
           {_gate_row("✅" if disp_ok else "⬜", "Displacement", disp_lbl, disp_cls)}
-          {_gate_row("✅" if pipe['choch'] else "⬜", "5M CHoCH", ch_lbl, ch_cls)}
+          {_gate_row("✅" if pipe['choch'] else "⬜", f"{LTF.upper()} CHoCH", ch_lbl, ch_cls)}
           <div style="text-align:center;margin-top:12px">
             <span class="signal-badge {sig_cls}">{"▲ " if sig=="LONG" else "▼ " if sig=="SHORT" else ""}{sig}</span>
           </div>
@@ -1774,7 +1774,7 @@ def _build_html(
     chart_svg = _render_chart_svg(df_5m, pipe, position) if df_5m is not None else "<p class='red'>No candle data</p>"
     chart_html = f"""
     <div class="card full-width">
-      <div class="card-title">Live SMC Chart — BTCUSDT 5M (last 60 bars)</div>
+      <div class="card-title">Live SMC Chart — {SYMBOL} {LTF.upper()} (last 60 bars)</div>
       {chart_svg}
     </div>"""
 

@@ -82,6 +82,20 @@ class TestBotStatePersistence:
         finally:
             bot_module._STATE_FILE = original
 
+    def test_last_signal_ts_roundtrip(self, tmp_path):
+        """last_signal_ts (signal-dedup key) defaults to '' and survives a restart."""
+        import smc_bot.bot as bot_module
+        original = bot_module._STATE_FILE
+        state_file = tmp_path / "state.json"
+        bot_module._STATE_FILE = state_file
+        try:
+            from smc_bot.bot import BotState
+            assert BotState().last_signal_ts == ""          # default
+            BotState(last_signal_ts="2026-06-18 10:00:00+00:00").save()
+            assert BotState.load().last_signal_ts == "2026-06-18 10:00:00+00:00"
+        finally:
+            bot_module._STATE_FILE = original
+
     def test_load_tolerates_corrupt_file(self, tmp_path):
         import smc_bot.bot as bot_module
         original = bot_module._STATE_FILE

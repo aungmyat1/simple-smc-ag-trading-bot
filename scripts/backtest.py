@@ -1170,11 +1170,13 @@ def main() -> None:
     parser.add_argument("--side", default="both", choices=["long", "short", "both"],
                         help="Trade direction filter (default: both)")
     parser.add_argument(
-        "--mitigation-pct", default="50",
+        "--mitigation-pct", default="none",
         choices=["none", "50", "75", "100"],
         help=(
-            "Mitigation consume threshold: none=off  50=midpoint (default)  "
-            "75=75%% from entry edge  100=zone fully consumed"
+            "Mitigation consume threshold: none=off (default — matches the "
+            "Trial 8/20/21/22 PASS config and smc_bot/config.yaml)  50=midpoint  "
+            "75=75%% from entry edge  100=zone fully consumed. Trials 9-10: any "
+            "level ON rejects ~76%% of 4H zones and collapses signal count."
         ),
     )
     parser.add_argument(
