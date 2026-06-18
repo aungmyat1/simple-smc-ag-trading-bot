@@ -98,6 +98,46 @@ FIB_DIST_MIN: float = 0.0
 TAKER_FEE  = 0.0006   # Bybit taker 0.06%/side (not in config.yaml — exchange constant)
 ROUND_TRIP = TAKER_FEE * 2
 
+# ── Transaction-cost model ────────────────────────────────────────────────────
+# Two regimes, selected by --cost-model (default "pct" → all prior BTC trials).
+#
+#   "pct"   — Bybit %-of-notional taker: cost_price = ROUND_TRIP × entry_price.
+#             Correct for a perpetual where fees scale with notional.
+#
+#   "forex" — fixed spread + commission in PIP terms (VT Markets Raw ECN).
+#             cost_price = (SPREAD_PIPS + COMMISSION_RT_PIPS) × PIP_SIZE.
+#             The %-model is WRONG for forex: 0.12% of EURUSD≈1.10 ≈ 13 pips
+#             round-trip (~10× real), which would unfairly fail every forex run.
+#
+# fee_r in both regimes = cost_price / stop_dist  (cost expressed in R).
+COST_MODEL: str          = "pct"     # "pct" | "forex"
+SPREAD_PIPS: float       = 0.8       # forex: typical EURUSD raw spread (one crossing)
+COMMISSION_RT_PIPS: float = 0.6      # forex: VT Markets Raw ≈ $3/side/lot ≈ 0.6 pip round-trip
+PIP_SIZE: float          = 0.0001    # forex: 0.0001 majors, 0.01 for JPY pairs
+
+
+def _cost_r(entry_price: float, stop_dist: float) -> float:
+    """Round-trip transaction cost expressed in R (cost_price / stop_dist).
+
+    pct   → ROUND_TRIP × entry_price             (Bybit, notional-scaled)
+    forex → (SPREAD_PIPS + COMMISSION_RT_PIPS) × PIP_SIZE   (fixed pip cost)
+    """
+    if stop_dist <= 0:
+        return 0.0
+    if COST_MODEL == "forex":
+        cost_price = (SPREAD_PIPS + COMMISSION_RT_PIPS) * PIP_SIZE
+    else:
+        cost_price = ROUND_TRIP * entry_price
+    return cost_price / stop_dist
+
+
+def _round_px(x: float) -> float:
+    """Trade-log price rounding: 5 dp under the forex cost model, 2 dp otherwise.
+
+    Metrics (gross_r/fee_r/net_r) are always computed from unrounded prices; this
+    only governs the audit columns. BTC output is unchanged (still 2 dp)."""
+    return round(x, 5) if COST_MODEL == "forex" else round(x, 2)
+
 # Mitigation threshold — fraction of zone height price must penetrate from the entry side
 # before the zone is considered consumed/invalid.  Set by --mitigation-pct at runtime.
 #   None = filter disabled (all zones pass through)
@@ -852,7 +892,7 @@ def run_backtest_asian(
                 tp1_pct=first_close_pct, tp1_r_actual=first_close_r,
             )
 
-        fee_r = ROUND_TRIP * entry_price / stop_dist
+        fee_r = _cost_r(entry_price, stop_dist)
         net_r = gross_r - fee_r
 
         trades.append({
@@ -861,10 +901,10 @@ def run_backtest_asian(
             "side":          "long" if bullish else "short",
             "setup":         sig.setup,
             "ts":            str(df_1h["ts"].iloc[i]),
-            "entry":         round(entry_price, 2),
-            "sl":            round(sl, 2),
-            "tp1":           round(first_close_at, 2),
-            "tp":            round(tp_full, 2),
+            "entry":         _round_px(entry_price),
+            "sl":            _round_px(sl),
+            "tp1":           _round_px(first_close_at),
+            "tp":            _round_px(tp_full),
             "first_close_r": round(first_close_r, 4),
             "tp_full_r":     round(tp_full_r, 4),
             "gross_r":       round(gross_r, 4),
@@ -1111,7 +1151,7 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
                 gross_r = (entry_price - exit_price) / stop_dist
             trade_side = "short"
 
-        fee_r = ROUND_TRIP * entry_price / stop_dist
+        fee_r = _cost_r(entry_price, stop_dist)
         net_r = gross_r - fee_r
 
         trades.append({
@@ -1119,9 +1159,9 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
             "exit_bar":  exit_bar,
             "side":      trade_side,
             "ts":        str(df_5m["ts"].iloc[i]) if "ts" in df_5m.columns else i,
-            "entry":     round(entry_price, 2),
-            "sl":        round(sl, 2),
-            "tp":        round(tp_full, 2),
+            "entry":     _round_px(entry_price),
+            "sl":        _round_px(sl),
+            "tp":        _round_px(tp_full),
             "gross_r":   round(gross_r, 4),
             "fee_r":     round(fee_r, 4),
             "net_r":     round(net_r, 4),
@@ -1167,6 +1207,14 @@ def run_backtest(df_1h: pd.DataFrame, df_5m: pd.DataFrame, side: str = "both") -
 
 # ── Phase-C report ────────────────────────────────────────────────────────────
 
+def _cost_label() -> str:
+    """One-line description of the active transaction-cost model for reports."""
+    if COST_MODEL == "forex":
+        return (f"Forex spread {SPREAD_PIPS:.1f}pip + commission {COMMISSION_RT_PIPS:.1f}pip "
+                f"round-trip (pip={PIP_SIZE})")
+    return f"Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip"
+
+
 def print_report(
     stats: dict,
     run_label: str = "Trial X",
@@ -1199,7 +1247,7 @@ def print_report(
             print(f"  Pool TP : {n_pool} pool-based  {no_pool} fallback ({no_pool/n_total*100:.0f}% no pool found)")
     else:
         print(f"  Exit    : TP={TGT_FALLBACK}R fallback  SL=sweep-wick±{SL_BUF*100:.1f}%")
-    print(f"  Fee     : Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip")
+    print(f"  Cost    : {_cost_label()}")
     print("-" * 60)
     print(f"  Trades  : {n}")
     print(f"  Win rate: {stats['win_rate']:.1f}%")
@@ -1274,7 +1322,7 @@ def print_report_asian(
           f"runner: SL→BE, target {ac.get('target_r',5.0):.0f}R")
     print(f"  Trail   : SL moves to entry (break-even, 0R) after first partial close")
     print(f"  Box SL  : ±{ac.get('sl_pct_of_range',0.25)*100:.0f}% of box range")
-    print(f"  Fee     : Bybit taker {TAKER_FEE*100:.2f}%/side = {ROUND_TRIP*100:.2f}% round-trip")
+    print(f"  Cost    : {_cost_label()}")
     print("-" * 60)
     print(f"  Trades  : {n}")
     print(f"  Win rate: {stats['win_rate']:.1f}%")
@@ -1357,14 +1405,20 @@ def _append_verdict_log(
     ac      = _CFG.get("session", {}).get("asian", {})
     date_str = _dt.date.today().isoformat()
     setup_desc = "sweep / range / trend" if setup_filter == "all" else f"{setup_filter} only"
+    start_h = ac.get("start_h", 0)
+    end_h   = ac.get("end_h", 8)
+    cost_note = (
+        _cost_label() if COST_MODEL == "forex"
+        else "Bybit taker 0.12% round-trip"
+    )
     row = (
-        f"| {trial_num} | {date_str} | **Asian session signal** — 4H macro bias + "
-        f"1H Asian box (00-08 UTC) → {setup_desc}. "
+        f"| {trial_num} | {date_str} | **Session box signal** — 4H macro bias + "
+        f"1H box ({start_h:02d}-{end_h:02d} UTC) → {setup_desc}. "
         f"Exit: {ac.get('first_close_pct',0.75)*100:.0f}% at box-edge/4R (SL→BE), "
         f"runner at {ac.get('target_r',5.0):.0f}R. "
         f"SL=±{ac.get('sl_pct_of_range',0.25)*100:.0f}% of box range. "
-        f"Config: smc_bot/config.yaml session.asian. "
-        f"5yr holdout (--htf BTCUSDT_240m, --ltf BTCUSDT_60m). | 4H+1H | "
+        f"Cost: {cost_note}. "
+        f"Config: smc_bot/config.yaml session.asian. | 4H+1H | "
         f"{n} | {gpf_str} | {stats['avg_fee_r']:.4f} | "
         f"{npf_str} | {stats['win_rate']:.1f}% | {verdict} |\n"
     )
@@ -1581,6 +1635,7 @@ def main() -> None:
     global MITIGATION_PCT, MITIGATION_MODE, BSLSSL_TP, TGT_MIN_RR
     global MACRO_BIAS, PARTIAL_TP, SESSION_FILTER, BOS_CONFIRM, FVG_ENTRIES
     global H1_BIAS_FILTER, FIB_DIST_MIN
+    global COST_MODEL, SPREAD_PIPS, COMMISSION_RT_PIPS, PIP_SIZE
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--htf", default=str(ROOT / "data" / "cache" / f"{SYMBOL}_60m.parquet"))
@@ -1686,7 +1741,35 @@ def main() -> None:
             "'trend' = wide box continuation only."
         ),
     )
+    # ── Step 5: forex transaction-cost model ──────────────────────────────────
+    parser.add_argument(
+        "--cost-model", default="pct", choices=["pct", "forex"],
+        help=(
+            "Transaction-cost model: 'pct' = Bybit %%-of-notional taker (default, "
+            "all BTC trials); 'forex' = fixed spread + commission in pips "
+            "(VT Markets Raw ECN). REQUIRED for EURUSD/GBPUSD validation — the "
+            "%%-model overstates forex cost ~10x."
+        ),
+    )
+    parser.add_argument(
+        "--spread-pips", type=float, default=0.8,
+        help="forex cost: average raw spread in pips, one crossing (default 0.8 = EURUSD).",
+    )
+    parser.add_argument(
+        "--commission-rt-pips", type=float, default=0.6,
+        help="forex cost: commission in pips, round-trip (default 0.6 = VT Markets Raw $3/side/lot).",
+    )
+    parser.add_argument(
+        "--pip-size", type=float, default=0.0001,
+        help="forex cost: pip size (default 0.0001 majors; use 0.01 for JPY pairs).",
+    )
     args = parser.parse_args()
+
+    # Apply forex cost-model settings (no-op for default --cost-model pct)
+    COST_MODEL         = args.cost_model
+    SPREAD_PIPS        = args.spread_pips
+    COMMISSION_RT_PIPS = args.commission_rt_pips
+    PIP_SIZE           = args.pip_size
 
     for label, path in [("HTF (1H)", args.htf), ("LTF (5M)", args.ltf)]:
         if not Path(path).exists():
