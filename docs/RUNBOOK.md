@@ -102,7 +102,47 @@ grep -E "mitigation_enabled|htf:|ltf:" smc_bot/config.yaml
 
 ---
 
-## 5. Stop / kill
+## 5. Health check / monitoring
+
+The bot is **file-based** (CSV/JSONL/parquet) — there is **no SQL database** in
+the architecture (CLAUDE.md §0). Any monitor that probes a Postgres on
+`127.0.0.1:5432` will false-alarm forever:
+
+```
+🚨 CRITICAL: Database Failure Detected
+DB connectivity check failed: ConnectionRefusedError: [Errno 111]
+Connect call failed ('127.0.0.1', 5432)
+```
+
+Point the VPS monitor at the canonical health check instead. Its database probe
+is **opt-in**: SKIPped unless a DB is actually configured, so it never raises a
+spurious CRITICAL.
+
+```bash
+python scripts/healthcheck.py                 # text report; exit 0/1/2
+python scripts/healthcheck.py --json          # machine-readable
+python scripts/healthcheck.py --check-bybit   # also probe Bybit market data
+python scripts/healthcheck.py --alert         # Telegram on WARN/FAIL only
+```
+
+Exit codes: `0` healthy, `1` warning, `2` critical. Checks: `database` (SKIP
+unless `HEALTHCHECK_DB_URL` / `DATABASE_URL` / `DB_HOST` is set), `disk`,
+`heartbeat` (state file freshness), and optional `bybit`.
+
+Cron (every 15 min, alert only on trouble):
+
+```cron
+*/15 * * * * cd ~/simple-smc-ag-trading-bot && \
+    .venv/bin/python scripts/healthcheck.py --check-bybit --alert
+```
+
+If you genuinely add a database later, set its connection via `DB_HOST`/`DB_PORT`
+(or a `DATABASE_URL`) in `.env` — then the check probes that host/port and a real
+outage correctly reports CRITICAL.
+
+---
+
+## 6. Stop / kill
 
 ```bash
 sudo systemctl stop smc-bot     # SIGTERM → state flushed (10s grace), Telegram notice
