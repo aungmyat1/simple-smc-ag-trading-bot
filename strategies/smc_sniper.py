@@ -212,11 +212,26 @@ class SMCSniper(BaseStrategy):
             log.debug("SMCSniper %s: CHoCH not confirmed", symbol)
             return None
 
-        # Steps 11-12: FVG retest (optional gate controlled by config)
+        # Steps 11-12: FVG retest gate — price must retrace into the displacement FVG
+        # that was created between the sweep bar and the CHoCH bar.
+        # This mirrors the logic in smc_bot/bot.py (get_owned_fvg path).
         if lc.get("fvg_retest_enabled", True):
-            # get_choch already embeds the FVG retest logic when the flag is set
-            # in the global CFG — here we re-check the result from choch
-            pass  # gate already enforced by confirmation module when enabled
+            choch_bar = len(df_ltf) - 1
+            owned_fvg = poi.get_owned_fvg(
+                df_ltf, bias,
+                sweep_bar        = int(sweep["bar_idx"]),
+                choch_bar        = choch_bar,
+                displacement_atr = lc["displacement_atr"],
+            )
+            if owned_fvg is None:
+                log.debug("SMCSniper %s: no owned FVG in sweep→CHoCH window — skip", symbol)
+                return None
+            if not (owned_fvg["low"] <= price <= owned_fvg["high"]):
+                log.debug(
+                    "SMCSniper %s: FVG retest pending — price=%.5f not in [%.5f, %.5f]",
+                    symbol, price, owned_fvg["low"], owned_fvg["high"],
+                )
+                return None
 
         # Step 13: SL at sweep wick ± pip buffer
         wick   = float(sweep["wick_extreme"])

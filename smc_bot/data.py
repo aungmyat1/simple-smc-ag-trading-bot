@@ -64,3 +64,22 @@ def get_candles(
 
     log.debug("Fetched %d closed %s candles for %s", len(df), timeframe, symbol)
     return df
+
+
+def fetch_candles(
+    symbol: str,
+    timeframe: str,
+    limit: int = 200,
+) -> pd.DataFrame | None:
+    """Convenience wrapper that creates its own ccxt client.
+
+    Used by runner.py's async executor dispatch so the caller doesn't need to
+    manage a shared client. Returns None on any failure so the caller can
+    handle it gracefully without crashing the event loop.
+    """
+    try:
+        client = make_client(testnet=False)
+        return get_candles(client, symbol, timeframe, limit)
+    except Exception as exc:
+        log.error("fetch_candles(%s, %s, %d) failed: %s", symbol, timeframe, limit, exc)
+        return None

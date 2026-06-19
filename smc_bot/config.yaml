@@ -1,7 +1,7 @@
 exchange:
   symbol: BTCUSDT
-  htf: 1h       # 1H bias + POI (Trial 25: 1H+5M+FVG-retest chain)
-  ltf: 5m       # 5M sweep + displacement + CHoCH + FVG retest
+  htf: 4h       # 4H bias + POI — T21/T22 PASS config (htf=4h, ltf=1h)
+  ltf: 1h       # 1H sweep + displacement + CHoCH
   # API keys come from .env (BYBIT_API_KEY / BYBIT_API_SECRET)
   # LIVE_TRADING must be False; only the owner flips it manually
 
@@ -42,7 +42,7 @@ poi:
 liquidity:
   swing_n: 3        # bars each side for 1H swing detection
   lookback: 30      # how many 1H bars to scan for prior swing levels
-  displacement_atr: 1.0   # Trial 21 baseline: 1.0×ATR post-sweep displacement gate
+  displacement_atr: 1.0   # T21 baseline: 1.0×ATR post-1H-sweep displacement gate
   ltf_poi_lookback: 15    # bars after sweep to scan for 5M entry OB/FVG
   fvg_retest_enabled: true   # require 5M FVG retest after CHoCH before entry
   fvg_retest_lookforward: 20 # max 5M bars after CHoCH to wait for FVG retest

@@ -35,23 +35,24 @@ def test_paper_mode_defaults_are_safe():
     assert cfg["bybit"]["demo"] is True, "Ship demo=true; owner flips for live only."
 
 
-def test_chain_is_1h_5m():
-    """Trial 25 chain is HTF=1h, LTF=5m (1H bias+POI → 5M sweep+CHoCH+FVG-retest)."""
+def test_chain_is_4h_1h():
+    """Live config must match the T21/T22 PASS baseline: HTF=4h, LTF=1h."""
     ex = _cfg()["exchange"]
-    assert ex["htf"] == "1h", (
-        "Trial 25 requires HTF=1h. "
-        "To revert to 4H+1H (Trial 22 PASS), update both config.yaml and this test."
+    assert ex["htf"] == "4h", (
+        "HTF must be 4h to match the T21/T22 Phase-0 PASS. "
+        "The 1H+5M chain (Trial 4) has no gross edge and must never be deployed. "
+        "Changing this is a new trial — register in VERDICT_LOG.md."
     )
-    assert ex["ltf"] == "5m", (
-        "Trial 25 requires LTF=5m. "
-        "To revert to 4H+1H (Trial 22 PASS), update both config.yaml and this test."
+    assert ex["ltf"] == "1h", (
+        "LTF must be 1h to match the T21/T22 Phase-0 PASS. "
+        "Changing this is a new trial — register in VERDICT_LOG.md."
     )
 
 
-def test_fvg_retest_enabled_for_trial_25():
-    """Trial 25 requires fvg_retest_enabled=true in liquidity config."""
+def test_fvg_retest_enabled():
+    """fvg_retest_enabled must be True — required by the 4H+1H entry chain."""
     lc = _cfg()["liquidity"]
     assert lc.get("fvg_retest_enabled") is True, (
-        "liquidity.fvg_retest_enabled must be True for Trial 25 (1H+5M FVG-retest chain). "
-        "Disabling it is a new trial — register in VERDICT_LOG.md."
+        "liquidity.fvg_retest_enabled must be True for the 4H+1H chain. "
+        "Disabling it changes entry behaviour — register as a new trial."
     )

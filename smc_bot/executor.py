@@ -18,6 +18,16 @@ BYBIT_MIN_QTY  = 0.001   # minimum order size in BTC
 BYBIT_QTY_STEP = 0.001   # quantity increment
 
 
+class PositionStateUnknownError(RuntimeError):
+    """Raised by get_position() when the API call fails.
+
+    Callers MUST NOT treat this as 'no position open'. Silently returning None
+    on API failure would cause the bot to place a duplicate order against an
+    already-open position (ghost duplicate risk). Instead, skip the cycle and
+    wait for the next poll when the exchange is reachable again.
+    """
+
+
 def _live() -> bool:
     return os.getenv("LIVE_TRADING", "false").lower() == "true"
 
@@ -60,7 +70,11 @@ def get_balance(session: HTTP, coin: str = "USDT") -> float:
 
 
 def get_position(session: HTTP, symbol: str) -> dict | None:
-    """Return the open position dict for symbol, or None if flat."""
+    """Return the open position dict for symbol, or None if flat.
+
+    Raises PositionStateUnknownError on any API failure so the caller can skip
+    the cycle rather than incorrectly assuming the account is flat.
+    """
     try:
         resp = session.get_positions(category="linear", symbol=symbol)
         for pos in resp["result"]["list"]:
@@ -69,7 +83,9 @@ def get_position(session: HTTP, symbol: str) -> dict | None:
         return None
     except Exception as exc:
         log.error("get_position failed: %s", exc)
-        return None
+        raise PositionStateUnknownError(
+            f"Cannot determine position state for {symbol}: {exc}"
+        ) from exc
 
 
 def place_order(

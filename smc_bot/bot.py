@@ -253,7 +253,15 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
         return
 
     # 3. Position check — detect close and update consecutive_losses counter
-    pos = executor.get_position(session, sym)
+    # PositionStateUnknownError means the API call failed; treat position state
+    # as uncertain and skip the cycle entirely to avoid ghost duplicate orders.
+    try:
+        pos = executor.get_position(session, sym)
+    except executor.PositionStateUnknownError as exc:
+        log.error("Position state unknown — skipping cycle: %s", exc)
+        alerts.send(f"⚠ SMC Bot [{sym}]: position state unknown, cycle skipped — {exc}")
+        state.save()
+        return
     in_position = pos is not None
 
     if state.was_in_position and not in_position:
@@ -667,6 +675,19 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
     order_id   = result.get("orderId", "")
     entry_time = datetime.now(timezone.utc).isoformat()
 
+    # Confirm actual fill price from the live position (not pre-order candle close).
+    # In paper/demo mode get_position returns None, so price is kept as fallback.
+    entry_price = price
+    if os.getenv("LIVE_TRADING", "false").lower() == "true":
+        time.sleep(0.5)   # brief wait for the position to register on exchange
+        try:
+            confirmed_pos = executor.get_position(session, sym)
+            if confirmed_pos:
+                entry_price = float(confirmed_pos.get("avgPrice", price))
+                log.info("Fill confirmed: avgPrice=%.2f (pre-order close was %.2f)", entry_price, price)
+        except executor.PositionStateUnknownError:
+            log.warning("Could not confirm fill price — using pre-order close %.2f", price)
+
     # ── TP1 reduce-only limit (50% close at 1R) ───────────────────────────────
     # Placed immediately after entry.  GTC; Bybit auto-cancels it if SL fires
     # and the position closes to zero before TP1 is reached.
@@ -708,7 +729,7 @@ def run_cycle(cfg: dict, client, session, state: BotState) -> None:
 
     state.open_order_id   = order_id
     state.entry_time      = entry_time
-    state.entry_price     = price
+    state.entry_price     = entry_price   # actual fill avgPrice (or pre-order close in paper)
     state.entry_qty       = qty
     state.tp1_filled      = False
     state.was_in_position = True
